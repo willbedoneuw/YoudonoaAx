@@ -284,6 +284,42 @@ def init():
         )
         """
     )
+    # ----------------------------------------------------------------------- #
+    # YoudonoaAx — Telegram section tables (additive; mirror the Rubika side).
+    # ----------------------------------------------------------------------- #
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_accounts (
+            phone         TEXT PRIMARY KEY,
+            name          TEXT DEFAULT '',
+            username      TEXT DEFAULT '',
+            user_id       INTEGER,
+            contacts      INTEGER DEFAULT 0,
+            session       TEXT,
+            status        TEXT DEFAULT 'active',
+            sent_total    INTEGER DEFAULT 0,
+            replied_total INTEGER DEFAULT 0,
+            created_at    TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_texts (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT DEFAULT 'tabchi',
+            text TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_dedup (
+            user_id INTEGER PRIMARY KEY,
+            sent_at TEXT
+        )
+        """
+    )
 
     # ---- migration: add accounts.worker_id (account -> worker affinity) ----
     cols = [r["name"] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
@@ -1660,3 +1696,157 @@ def get_discovery_delay() -> float:
 
 def set_discovery_delay(value):
     set_setting("discovery_delay", config.clamp_discovery_delay(value))
+
+
+
+# =========================================================================== #
+# YoudonoaAx — Telegram section helpers (additive).
+# =========================================================================== #
+def tg_upsert_account(phone, name, username, user_id, contacts, session):
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO tg_accounts (phone, name, username, user_id, contacts, "
+        "session, status, created_at) VALUES (?,?,?,?,?,?, 'active', ?) "
+        "ON CONFLICT(phone) DO UPDATE SET name=excluded.name, "
+        "username=excluded.username, user_id=excluded.user_id, "
+        "contacts=excluded.contacts, session=excluded.session, status='active'",
+        (phone, name, username, user_id, contacts, session, _now()))
+    conn.commit()
+    conn.close()
+
+
+def tg_set_session(phone, session):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET session=? WHERE phone=?", (session, phone))
+    conn.commit()
+    conn.close()
+
+
+def tg_get_account(phone) -> dict:
+    conn = _conn()
+    row = conn.execute("SELECT * FROM tg_accounts WHERE phone=?", (phone,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def tg_get_account_by_id(account_pk) -> dict:
+    """tg accounts are keyed by phone; this resolves by rowid for callbacks."""
+    conn = _conn()
+    row = conn.execute("SELECT rowid AS rid, * FROM tg_accounts WHERE rowid=?",
+                       (account_pk,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def tg_list_accounts() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT rowid AS rid, * FROM tg_accounts "
+                        "ORDER BY created_at").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def tg_set_status(phone, status):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET status=? WHERE phone=?", (status, phone))
+    conn.commit()
+    conn.close()
+
+
+def tg_delete_account(phone):
+    conn = _conn()
+    conn.execute("DELETE FROM tg_accounts WHERE phone=?", (phone,))
+    conn.commit()
+    conn.close()
+
+
+def tg_incr_sent(phone, n: int = 1):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET sent_total = sent_total + ? WHERE phone=?",
+                 (n, phone))
+    conn.commit()
+    conn.close()
+
+
+def tg_incr_replied(phone, n: int = 1):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET replied_total = replied_total + ? "
+                 "WHERE phone=?", (n, phone))
+    conn.commit()
+    conn.close()
+
+
+# ---- tabchi texts ----
+def tg_add_text(text, kind: str = "tabchi"):
+    text = (text or "").strip()
+    if not text:
+        return
+    conn = _conn()
+    conn.execute("INSERT INTO tg_texts (kind, text) VALUES (?,?)", (kind, text))
+    conn.commit()
+    conn.close()
+
+
+def tg_list_texts(kind: str = "tabchi") -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT text FROM tg_texts WHERE kind=? ORDER BY id",
+                        (kind,)).fetchall()
+    conn.close()
+    return [r["text"] for r in rows]
+
+
+def tg_clear_texts(kind: str = "tabchi"):
+    conn = _conn()
+    conn.execute("DELETE FROM tg_texts WHERE kind=?", (kind,))
+    conn.commit()
+    conn.close()
+
+
+# ---- mutual-send content + speed (stored in the generic settings table) ----
+def tg_set_mutual_content(text="", media="", caption=""):
+    set_setting("tg_mutual_text", text or "")
+    set_setting("tg_mutual_media", media or "")
+    set_setting("tg_mutual_caption", caption or "")
+
+
+def tg_get_mutual_content() -> dict:
+    return {"text": get_setting("tg_mutual_text", "") or "",
+            "media": get_setting("tg_mutual_media", "") or "",
+            "caption": get_setting("tg_mutual_caption", "") or ""}
+
+
+def tg_get_send_delay() -> float:
+    return config.clamp_tg_delay(get_float_setting("tg_send_delay", config.TG_SEND_DELAY))
+
+
+def tg_set_send_delay(value):
+    set_setting("tg_send_delay", config.clamp_tg_delay(value))
+
+
+def tg_get_tabchi_interval() -> int:
+    return config.clamp_tg_interval(get_int_setting("tg_tabchi_interval",
+                                                    config.TG_TABCHI_INTERVAL))
+
+
+def tg_set_tabchi_interval(value):
+    set_setting("tg_tabchi_interval", config.clamp_tg_interval(value))
+
+
+# ---- mutual-send global dedup ledger ----
+def tg_was_sent(user_id) -> bool:
+    if not user_id:
+        return False
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM tg_dedup WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def tg_mark_sent(user_id):
+    if not user_id:
+        return
+    conn = _conn()
+    conn.execute("INSERT OR IGNORE INTO tg_dedup (user_id, sent_at) VALUES (?,?)",
+                 (user_id, _now()))
+    conn.commit()
+    conn.close()

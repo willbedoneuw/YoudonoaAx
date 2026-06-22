@@ -379,3 +379,40 @@ def clamp_discovery_delay(value) -> float:
     except (TypeError, ValueError):
         return DISCOVERY_PROBE_DELAY
     return max(0.1, min(10.0, v))
+
+
+
+# --------------------------------------------------------------------------- #
+# YoudonoaAx — Telegram section (additive; reuses API_ID/API_HASH above).
+# --------------------------------------------------------------------------- #
+# Max seconds we will honor a Telegram FloodWait before giving up on a call.
+TG_FLOOD_MAX_WAIT = _int("TG_FLOOD_MAX_WAIT", 300)
+# Send speed for the Telegram side is clamped to 0.2 .. 1.0 seconds.
+TG_SEND_DELAY_MIN = _float("TG_SEND_DELAY_MIN", 0.2)
+TG_SEND_DELAY_MAX = _float("TG_SEND_DELAY_MAX", 1.0)
+TG_SEND_DELAY = _float("TG_SEND_DELAY", 0.5)
+# Human-like typing indicator window before each send (seconds, randomized).
+TG_TYPING_MIN = _float("TG_TYPING_MIN", 0.4)
+TG_TYPING_MAX = _float("TG_TYPING_MAX", 2.0)
+# Default per-account interval (seconds) between tabchi passes over the groups.
+TG_TABCHI_INTERVAL = _int("TG_TABCHI_INTERVAL", 1800)
+TG_TABCHI_MIN_INTERVAL = _int("TG_TABCHI_MIN_INTERVAL", 30)
+TG_TABCHI_MAX_INTERVAL = _int("TG_TABCHI_MAX_INTERVAL", 86400)
+# How often (s) the live pinned tabchi stats card is refreshed.
+TG_STATS_REFRESH = _float("TG_STATS_REFRESH", 5.0)
+
+
+def clamp_tg_delay(value) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return TG_SEND_DELAY
+    return max(TG_SEND_DELAY_MIN, min(TG_SEND_DELAY_MAX, v))
+
+
+def clamp_tg_interval(value) -> int:
+    try:
+        v = int(float(value))
+    except (TypeError, ValueError):
+        return TG_TABCHI_INTERVAL
+    return max(TG_TABCHI_MIN_INTERVAL, min(TG_TABCHI_MAX_INTERVAL, v))
