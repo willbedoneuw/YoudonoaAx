@@ -369,3 +369,13 @@ def clamp_linkdooni_interval(value) -> int:
     except (TypeError, ValueError):
         return LINKDOONI_SEND_INTERVAL
     return max(LINKDOONI_MIN_INTERVAL, min(LINKDOONI_MAX_INTERVAL, value))
+
+
+
+def clamp_discovery_delay(value) -> float:
+    """Probe delay for the discovery engine. Allows fast values like 0.2."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return DISCOVERY_PROBE_DELAY
+    return max(0.1, min(10.0, v))

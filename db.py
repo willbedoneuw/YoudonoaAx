@@ -1649,3 +1649,14 @@ def clear_linkdooni_texts():
     conn.execute("DELETE FROM linkdooni_texts")
     conn.commit()
     conn.close()
+
+
+
+# ---- Item 2: discovery probe speed (panel-editable; presets incl. 0.2) ----
+def get_discovery_delay() -> float:
+    return config.clamp_discovery_delay(
+        get_float_setting("discovery_delay", config.DISCOVERY_PROBE_DELAY))
+
+
+def set_discovery_delay(value):
+    set_setting("discovery_delay", config.clamp_discovery_delay(value))

@@ -260,8 +260,7 @@ def main_menu(owner: bool = True):
         [Button.inline("📤 ارسال چند اکانت", b"multisend"),
          Button.inline("🧠 مغز", b"brain")],
         [Button.inline("➕ افزودن مخاطب", b"contacts"),
-         Button.inline("📨 لینکدونی", b"linkdooni")],
-        [Button.inline("⚙️ تنظیمات", b"settings")],
+         Button.inline("⚙️ تنظیمات", b"settings")],
     ]
     if owner:
         rows.append([Button.inline("👥 مدیریت ادمین", b"admins")])
@@ -2366,6 +2365,7 @@ async def automation_menu_cb(event):
         rows.append([Button.inline(f"{'🟢' if on else '⚪️'} {a['phone']}",
                                    f"auto_{a['id']}".encode())])
     rows.append([Button.inline("🪪 سینک اسم/بیو همه اکانت‌ها", b"psync")])
+    rows.append([Button.inline("📨 لینکدونی (موتور گروه‌ها)", b"linkdooni")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     await safe_edit(event, "🔁 اتومیشن — یک اکانت انتخاب کن:", buttons=rows)
 
@@ -4910,7 +4910,7 @@ async def _discover_for_account(acc, prefix, target, ctl, tag=""):
     """Probe random numbers built from `prefix` until `target` Rubika-having
     guids are found (or attempts/stop). Returns the list of found guids."""
     phone = acc["phone"]
-    delay = config.DISCOVERY_PROBE_DELAY
+    delay = db.get_discovery_delay()
     max_attempts = config.DISCOVERY_MAX_ATTEMPTS
     session_seen: set = set()
     w = worker.worker_for_account(acc)
@@ -5021,13 +5021,15 @@ async def _run_discovery(owner_id, accounts, prefix, mode, text):
     """Discover DISCOVERY_TARGET rubika-having numbers per account, then send to
     them in the chosen mode, and report the success rate."""
     target = config.DISCOVERY_TARGET
+    _mode_label = ("بدون ارسال (فقط ساخت مخاطب)" if mode == "none"
+                   else ("متن دلخواه" if mode == "text" else "مارکر"))
     for i, a in enumerate(accounts, 1):
         a["_tag"] = f"#A{i}" if len(accounts) > 1 else ""
     await log(card("🔎 DISCOVERY START", [
         f"☎️ پیش‌شماره : {prefix}",
         f"👥 اکانت‌ها : {len(accounts)}",
         f"🎯 هدف هر اکانت : {target} روبیکادار",
-        f"✍️ حالت ارسال : {'متن دلخواه' if mode == 'text' else 'مارکر'}",
+        f"✍️ حالت : {_mode_label}",
         f"🕒 {now()}"]))
     grand_ok = grand_fail = grand_found = 0
     for acc in accounts:
@@ -5076,6 +5078,8 @@ async def _run_discovery(owner_id, accounts, prefix, mode, text):
             f"🕒 {now()}"]))
         if not guids:
             continue
+        if mode == "none":
+            continue        # «بدون ارسال»: فقط مخاطب ساخته شد، چیزی فرستاده نمی‌شه
         # straight into the send pipeline (Item 2 wiring)
         try:
             ok, fail = await _send_to_guids(owner_id, acc, guids, mode, text, tag=ltag)
@@ -5088,6 +5092,19 @@ async def _run_discovery(owner_id, accounts, prefix, mode, text):
             await log(card("🔎 ارسال — خطا", [f"{ltag}📱 {phone}", f"💥 {repr(e)[:140]}"]))
     attempted = grand_ok + grand_fail
     pct = int(grand_ok * 100 / attempted) if attempted else 0
+    if mode == "none":
+        await log(card("🏁 DISCOVERY — پایان (بدون ارسال)", [
+            f"🎯 مجموع پیداشده/ساخته‌شده : {grand_found} مخاطب روبیکادار",
+            "📵 طبق انتخابت چیزی ارسال نشد.",
+            f"🕒 {now()}"]))
+        try:
+            await bot.send_message(owner_id, card("🔎 کشف دوست تمام شد ✅ (بدون ارسال)", [
+                f"🎯 پیداشده : {grand_found} مخاطب روبیکادار",
+                "📵 ارسالی انجام نشد — مخاطب‌ها ساخته شدن، هر وقت خواستی از بخش ارسال بفرست."]),
+                buttons=main_menu(owner_id == config.OWNER_ID))
+        except Exception:
+            pass
+        return
     await log(card("🏁 DISCOVERY — پایان", [
         f"🎯 مجموع پیداشده : {grand_found} روبیکادار",
         f"✅ ارسال موفق : {grand_ok}   ❌ ناموفق : {grand_fail}",
@@ -5106,6 +5123,7 @@ async def _run_discovery(owner_id, accounts, prefix, mode, text):
 def _discovery_mode_buttons():
     return [[Button.inline("📌 ارسال مارکر", b"dmode_marker"),
              Button.inline("✍️ متن دلخواه", b"dmode_text")],
+            [Button.inline("📵 بدون ارسال (فقط بساز)", b"dmode_none")],
             [Button.inline("🔙 لغو", b"home")]]
 
 
@@ -5120,12 +5138,33 @@ async def discover_menu_cb(event):
         return
     rows = [[Button.inline(f"🔎 {a['phone']}", f"dpick_{a['id']}".encode())]
             for a in accounts]
+    spd = db.get_discovery_delay()
+    rows.append([Button.inline(f"⏱ سرعت پروب: {spd}s", b"dspd_show")])
+    rows.append([Button.inline("0.2s", b"dspd_0.2"),
+                 Button.inline("0.5s", b"dspd_0.5"),
+                 Button.inline("1s", b"dspd_1"),
+                 Button.inline("2s", b"dspd_2")])
     rows.append([Button.inline("🔙 بازگشت", b"contacts")])
     await safe_edit(event,
         "🔎 کشف دوست با پیش‌شماره\n"
         f"{LINE}\nیک اکانت انتخاب کن، بعد پیش‌شماره رو بفرست.\n"
-        f"ربات تا پیدا کردن {config.DISCOVERY_TARGET} شماره‌ی روبیکادار ادامه می‌ده.",
+        f"ربات تا پیدا کردن {config.DISCOVERY_TARGET} شماره‌ی روبیکادار ادامه می‌ده.\n"
+        f"⏱ سرعتِ پروب الان: {spd} ثانیه (هرچی کمتر = سریع‌تر ولی پرریسک‌تر).",
         buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"dspd_(.+)"))
+async def discover_speed_cb(event):
+    if not is_owner(event):
+        return
+    val = event.pattern_match.group(1).decode()
+    if val == "show":
+        await event.answer(f"سرعت پروب فعلی: {db.get_discovery_delay()}s — یکی از پریست‌ها رو بزن.",
+                           alert=True)
+        return
+    db.set_discovery_delay(val)
+    await event.answer(f"⏱ سرعت پروب روی {db.get_discovery_delay()}s تنظیم شد.")
+    await discover_menu_cb(event)
 
 
 @bot.on(events.CallbackQuery(pattern=b"dpick_(\\d+)"))
@@ -5194,6 +5233,27 @@ async def discover_mode_marker_cb(event):
     await safe_edit(event, "🔎 کشف دوست شروع شد (حالت: مارکر). گزارش‌ها تو گروه لاگ میاد.",
                     buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
     asyncio.create_task(_run_discovery(event.sender_id, accounts, prefix, "marker", ""))
+
+
+@bot.on(events.CallbackQuery(data=b"dmode_none"))
+async def discover_mode_none_cb(event):
+    """Discover only — find the rubika-having numbers but DO NOT send anything."""
+    if not is_owner(event):
+        return
+    st = state.get(event.sender_id) or {}
+    if st.get("step") != "await_discover_mode":
+        await event.answer("منقضی شده. دوباره شروع کن.", alert=True)
+        return
+    ids = st.get("ids") or []
+    prefix = st.get("prefix")
+    state.pop(event.sender_id, None)
+    accounts = [a for a in (db.get_account(i) for i in ids) if a]
+    if not accounts or not prefix:
+        await event.answer("اطلاعات ناقصه.", alert=True)
+        return
+    await safe_edit(event, "🔎 کشف دوست شروع شد (بدون ارسال — فقط ساختِ مخاطب). گزارش تو گروه لاگ میاد.",
+                    buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+    asyncio.create_task(_run_discovery(event.sender_id, accounts, prefix, "none", ""))
 
 
 @bot.on(events.CallbackQuery(data=b"dmode_text"))
@@ -6144,7 +6204,7 @@ def _linkdooni_menu_buttons():
         rows.append([Button.inline("⏹ توقف موتور", b"ld_stop")])
     else:
         rows.append([Button.inline("▶️ شروع موتور", b"ld_start")])
-    rows.append([Button.inline("🔙 بازگشت", b"home")])
+    rows.append([Button.inline("🔙 بازگشت به اتومیشن", b"automation")])
     return rows
 
 
