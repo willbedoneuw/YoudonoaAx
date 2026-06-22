@@ -1848,7 +1848,12 @@ def tg_set_mutual_content(text="", media="", caption=""):
 def tg_get_mutual_content() -> dict:
     return {"text": get_setting("tg_mutual_text", "") or "",
             "media": get_setting("tg_mutual_media", "") or "",
-            "caption": get_setting("tg_mutual_caption", "") or ""}
+            "caption": get_setting("tg_mutual_caption", "") or "",
+            "text2": get_setting("tg_mutual_text2", "") or ""}
+
+
+def tg_set_mutual_text2(text=""):
+    set_setting("tg_mutual_text2", text or "")
 
 
 def tg_get_send_delay() -> float:
