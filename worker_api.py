@@ -50,6 +50,7 @@ _automations: dict = {}  # phone -> automation state dict
 _secretaries: dict = {}  # phone -> secretary state dict
 _channelreports: dict = {}  # phone -> channel-report state dict
 _replies: dict = {}     # phone -> reply-responder state dict
+_linkdoonis: dict = {}  # phone -> linkdooni send-loop state dict (YoudonoaAx Item 3)
 _extras_logs: list = []  # queued log-card strings; drained by the master
 
 LINE = "━━━━━━━━━━━━━━━━"
@@ -211,6 +212,19 @@ def _build_app():
         delay: float = 1.0
         max_errors: int = 5
         send_timeout: int = 60
+        mode: str = "marker"      # 'marker' (forward) or 'text' (send_text)
+        text: str = ""
+
+    class LinkdooniIn(BaseModel):
+        phone: str
+        group_guids: list = []
+        texts: list = []
+        interval: int = 1800
+
+    class LinkdooniExtractIn(BaseModel):
+        phone: str
+        channels: list = []
+        scan: int = 100
 
     class ChannelCreateIn(BaseModel):
         phone: str
@@ -475,6 +489,64 @@ def _build_app():
                 await client.disconnect()
             except Exception:
                 pass
+
+    # ----- linkdooni engine: scheduled send to a SPECIFIC set of groups -----
+    @app.post("/linkdooni/start")
+    async def linkdooni_start(body: LinkdooniIn, authorization: str = Header(None)):
+        _auth(authorization)
+        await _stop_linkdooni(body.phone)
+        if not body.texts or not body.group_guids:
+            return {"ok": False, "error": "no texts or no groups"}
+        st = {"stop": False, "sent": 0, "task": None,
+              "guids": list(body.group_guids),
+              "texts": list(body.texts),
+              "interval": config.clamp_linkdooni_interval(body.interval)}
+        st["task"] = asyncio.create_task(_run_linkdooni(body.phone, st))
+        _linkdoonis[rb.normalize_phone(body.phone)] = st
+        return {"ok": True}
+
+    @app.post("/linkdooni/stop")
+    async def linkdooni_stop(body: LinkdooniIn, authorization: str = Header(None)):
+        _auth(authorization)
+        sent = await _stop_linkdooni(body.phone)
+        return {"ok": True, "sent": sent}
+
+    @app.get("/linkdooni/status")
+    async def linkdooni_status(phone: str, authorization: str = Header(None)):
+        _auth(authorization)
+        st = _linkdoonis.get(rb.normalize_phone(phone))
+        if not st:
+            return {"running": False, "sent": 0}
+        return {"running": not st["stop"], "sent": st["sent"]}
+
+    @app.post("/linkdooni/extract")
+    async def linkdooni_extract(body: LinkdooniExtractIn,
+                                authorization: str = Header(None)):
+        _auth(authorization)
+        async def _do(client):
+            links = []
+            for ch in (body.channels or []):
+                try:
+                    guid, _title = await asyncio.wait_for(
+                        rb.resolve_channel(client, ch), timeout=60)
+                except Exception:
+                    continue
+                try:
+                    msgs = await asyncio.wait_for(
+                        rb.get_recent_messages(client, guid, body.scan), timeout=90)
+                except Exception:
+                    msgs = []
+                for m in msgs:
+                    for lk in rb.extract_group_links(rb._msg_text_of(m)):
+                        if lk not in links:
+                            links.append(lk)
+            return links
+        try:
+            links = await account_conn.call(body.phone, _do, timeout=600)
+            return {"ok": True, "links": links}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "links": [], "error": repr(e)[:200]}
+
 
     # ----- automation EXTRAS: secretary / channel report / reply / profile ----
     @app.post("/secretary/start")
@@ -741,17 +813,25 @@ def _build_app():
         # brain to message only the freshly-added contacts). Same 5-consecutive
         # -> pause -> resume protection.
         async def _do(client):
-            saved_guid, mid = await rb.find_marked_message(client, body.marker or "")
-            if not mid:
-                return {"marker_found": False, "sent": 0, "fail": 0}
+            mode = (body.mode or "marker").lower()
+            saved_guid = mid = None
+            if mode != "text":
+                saved_guid, mid = await rb.find_marked_message(client, body.marker or "")
+                if not mid:
+                    return {"marker_found": False, "sent": 0, "fail": 0}
             ok = 0
             fail = 0
             attempt_fail = 0
             for g in (body.guids or []):
                 try:
-                    await asyncio.wait_for(
-                        rb.forward_message(client, saved_guid, g, mid),
-                        timeout=body.send_timeout)
+                    if mode == "text":
+                        await asyncio.wait_for(
+                            rb.send_text(client, g, body.text or ""),
+                            timeout=body.send_timeout)
+                    else:
+                        await asyncio.wait_for(
+                            rb.forward_message(client, saved_guid, g, mid),
+                            timeout=body.send_timeout)
                     ok += 1
                     attempt_fail = 0
                 except Exception:
@@ -868,6 +948,53 @@ async def _state_sleep(st: dict, seconds: float):
     while waited < seconds and not st.get("stop"):
         await asyncio.sleep(1.0)
         waited += 1.0
+
+
+async def _stop_linkdooni(phone: str) -> int:
+    st = _linkdoonis.pop(rb.normalize_phone(phone), None)
+    if not st:
+        return 0
+    st["stop"] = True
+    task = st.get("task")
+    if task:
+        try:
+            await asyncio.wait_for(task, timeout=10)
+        except Exception:
+            task.cancel()
+    return st.get("sent", 0)
+
+
+async def _run_linkdooni(phone: str, state: dict):
+    """Worker-side linkdooni loop — ONE connection per pass. Sends a random
+    configured text to ONLY the assigned group guids every interval. Logs are
+    queued for the master to drain."""
+    last_text: dict = {}
+    try:
+        while not state["stop"]:
+            try:
+                async with account_conn.connection(phone) as client:
+                    for guid in list(state["guids"]):
+                        if state["stop"]:
+                            break
+                        idx, txt = _pick_text(state["texts"], last_text.get(guid))
+                        if txt is None:
+                            break
+                        try:
+                            await asyncio.wait_for(
+                                rb.send_text(client, guid, txt),
+                                timeout=config.SEND_TIMEOUT)
+                            state["sent"] += 1
+                            last_text[guid] = idx
+                        except Exception:
+                            pass
+                        await asyncio.sleep(random.uniform(
+                            config.LINKDOONI_GROUP_DELAY_MIN,
+                            config.LINKDOONI_GROUP_DELAY_MAX))
+            except Exception:
+                account_conn.drop_connection(phone)
+            await _state_sleep(state, state["interval"])
+    except Exception:
+        pass
 
 
 async def _stop_secretary(phone: str):

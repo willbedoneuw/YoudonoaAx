@@ -331,3 +331,41 @@ def clamp_contact_delay(value) -> float:
     except (TypeError, ValueError):
         return CONTACT_ADD_DELAY
     return max(CONTACT_MIN_DELAY, min(CONTACT_MAX_DELAY, value))
+
+
+
+# --------------------------------------------------------------------------- #
+# YoudonoaAx UPDATE — three confirmed update items (additive only; nothing
+# above is removed). All values are .env-overridable with sane defaults.
+#   Item 1: contact import live progress + stop/pause/resume
+#   Item 2: prefix-based contact discovery engine (-> send pipeline marker|text)
+#   Item 3: linkdooni automation engine (discover/join groups + scheduled send)
+# --------------------------------------------------------------------------- #
+
+# ---- Item 1: contact-import live progress ----
+CONTACT_PROGRESS_EVERY = _float("CONTACT_PROGRESS_EVERY", 4.0)
+CONTACT_REMOTE_CHUNK = _int("CONTACT_REMOTE_CHUNK", 25)
+
+# ---- Item 2: contact discovery (موتور کشف مخاطب با پیش‌شماره) ----
+DISCOVERY_TARGET = _int("DISCOVERY_TARGET", 150)
+DISCOVERY_MAX_ATTEMPTS = _int("DISCOVERY_MAX_ATTEMPTS", 8000)
+DISCOVERY_PROBE_DELAY = _float("DISCOVERY_PROBE_DELAY", 0.7)
+
+# ---- Item 3: linkdooni engine (موتور لینکدونی) ----
+LINKDOONI_DAILY_GROUPS = _int("LINKDOONI_DAILY_GROUPS", 30)
+LINKDOONI_SEND_INTERVAL = _int("LINKDOONI_SEND_INTERVAL", 1800)   # 30 min
+LINKDOONI_MIN_INTERVAL = _int("LINKDOONI_MIN_INTERVAL", 30)
+LINKDOONI_MAX_INTERVAL = _int("LINKDOONI_MAX_INTERVAL", 86400)
+LINKDOONI_DISCOVER_INTERVAL = _int("LINKDOONI_DISCOVER_INTERVAL", 86400)  # daily
+LINKDOONI_SUMMARY_INTERVAL = _int("LINKDOONI_SUMMARY_INTERVAL", 1200)     # 20 min
+LINKDOONI_CHANNEL_SCAN = _int("LINKDOONI_CHANNEL_SCAN", 100)
+LINKDOONI_GROUP_DELAY_MIN = _float("LINKDOONI_GROUP_DELAY_MIN", 0.5)
+LINKDOONI_GROUP_DELAY_MAX = _float("LINKDOONI_GROUP_DELAY_MAX", 2.0)
+
+
+def clamp_linkdooni_interval(value) -> int:
+    try:
+        value = int(float(value))
+    except (TypeError, ValueError):
+        return LINKDOONI_SEND_INTERVAL
+    return max(LINKDOONI_MIN_INTERVAL, min(LINKDOONI_MAX_INTERVAL, value))

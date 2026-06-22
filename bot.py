@@ -97,6 +97,12 @@ automation_tasks: dict = {}
 secretary_tasks: dict = {}
 reply_tasks: dict = {}
 channelreport_tasks: dict = {}
+# YoudonoaAx UPDATE: live-control jobs keyed by account_id.
+#   contact_jobs  -> Item 1 (contact import) + Item 2 (discovery) live controls
+#   linkdooni_tasks -> Item 3 per-account send loops {account_id: {task,state}}
+contact_jobs: dict = {}
+linkdooni_tasks: dict = {}
+linkdooni_engine: dict = {}        # {"task": Task, "stop": bool} for the orchestrator
 
 
 def _alert_word(n: int) -> str:
@@ -254,7 +260,8 @@ def main_menu(owner: bool = True):
         [Button.inline("📤 ارسال چند اکانت", b"multisend"),
          Button.inline("🧠 مغز", b"brain")],
         [Button.inline("➕ افزودن مخاطب", b"contacts"),
-         Button.inline("⚙️ تنظیمات", b"settings")],
+         Button.inline("📨 لینکدونی", b"linkdooni")],
+        [Button.inline("⚙️ تنظیمات", b"settings")],
     ]
     if owner:
         rows.append([Button.inline("👥 مدیریت ادمین", b"admins")])
@@ -906,6 +913,18 @@ async def message_router(event):
         await handle_set_senddelay(event, st)
     elif step == "await_set_contactspeed":
         await handle_set_contactspeed(event, st)
+    elif step == "await_discover_prefix":
+        await handle_discover_prefix(event, st)
+    elif step == "await_discover_text":
+        await handle_discover_text(event, st)
+    elif step == "await_ld_channels":
+        await handle_ld_channels(event, st)
+    elif step == "await_ld_text":
+        await handle_ld_text(event, st)
+    elif step == "await_ld_interval":
+        await handle_ld_interval(event, st)
+    elif step == "await_ld_daily":
+        await handle_ld_daily(event, st)
 
 
 async def handle_delay(event):
@@ -1206,6 +1225,11 @@ async def run_send(owner_id: int, payload: dict):
     start_idx = int(payload.get("start_idx") or 0)
     base_ok = int(payload.get("base_ok") or 0)
     suppress_panel = bool(payload.get("suppress_resume_panel"))
+    # YoudonoaAx UPDATE (Item 2): the send pipeline can either forward the
+    # marked Saved-Messages post ('marker' mode, the original behaviour) or send
+    # a custom configured text ('text' mode). Default stays 'marker'.
+    mode = (payload.get("mode") or "marker").lower()
+    send_body = payload.get("text") or ""
     marker = db.get_marker()
     delay = db.get_delay()
     max_errors = db.get_max_errors()
@@ -1231,7 +1255,8 @@ async def run_send(owner_id: int, payload: dict):
         f"🎯 Targets : {total}" + (f"  (ادامه از {start_idx})" if start_idx else ""),
         f"⏱ Delay : {delay}s",
         f"🧯 Max consecutive errors : {max_errors}",
-        f"📌 Marker : «{marker}» Found ✅",
+        (f"✍️ Mode : متن دلخواه" if mode == "text"
+         else f"📌 Marker : «{marker}» Found ✅"),
     ]))
 
     n = total
@@ -1253,10 +1278,16 @@ async def run_send(owner_id: int, payload: dict):
                 guid = recipients[idx]
                 idx += 1
                 try:
-                    await asyncio.wait_for(
-                        rb.forward_message(client, saved_guid, guid, mid),
-                        timeout=config.SEND_TIMEOUT,
-                    )
+                    if mode == "text":
+                        await asyncio.wait_for(
+                            rb.send_text(client, guid, send_body),
+                            timeout=config.SEND_TIMEOUT,
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            rb.forward_message(client, saved_guid, guid, mid),
+                            timeout=config.SEND_TIMEOUT,
+                        )
                     ok += 1
                     attempt_fail = 0          # count CONSECUTIVE errors only
                     done_ok = base_ok + ok
@@ -1348,16 +1379,21 @@ async def run_send(owner_id: int, payload: dict):
     if dead:
         db.set_status(account_id, "inactive")
 
+    # YoudonoaAx UPDATE (Item 2): success-rate % shown in the report card.
+    _attempted = grand_ok + fail
+    success_pct = int(grand_ok * 100 / _attempted) if _attempted else 0
+
     if reason:
         await log(card("⛔ SEND STOPPED", [
             f"{_lbl()}👤 Account : {phone}",
             f"📊 ✅ {grand_ok}   ❌ {fail}   📁 {base_ok + total}",
+            f"📈 نرخ موفقیت : {success_pct}%   (ناموفق: {fail})",
             f"⚠️ Reason : {reason}",
             f"⏱ Duration : {dur}",
             f"🕒 {now()}",
         ]))
         try:
-            await bot.send_message(owner_id, f"⛔ ارسال متوقف شد. ✅ {grand_ok} / ❌ {fail}\nدلیل: {reason}",
+            await bot.send_message(owner_id, f"⛔ ارسال متوقف شد. ✅ {grand_ok} / ❌ {fail} — نرخ موفقیت {success_pct}%\nدلیل: {reason}",
                                    buttons=main_menu(owner_id == config.OWNER_ID))
         except Exception:
             pass
@@ -1367,10 +1403,11 @@ async def run_send(owner_id: int, payload: dict):
             f"{_lbl()}👤 Account : {phone}",
             LINE,
             f"✅ {grand_ok}   ❌ {fail}   📁 {base_ok + total}",
+            f"📈 نرخ موفقیت : {success_pct}%   (ناموفق: {fail})",
             f"⏱ Duration : {dur}",
         ]))
         try:
-            await bot.send_message(owner_id, f"✅ ارسال تمام شد. ✅ {grand_ok} / ❌ {fail}",
+            await bot.send_message(owner_id, f"✅ ارسال تمام شد. ✅ {grand_ok} / ❌ {fail} — نرخ موفقیت {success_pct}%",
                                    buttons=main_menu(owner_id == config.OWNER_ID))
         except Exception:
             pass
@@ -4150,7 +4187,11 @@ async def amain():
     # health & self-heal engine (verify sessions, relaunch stalled automation,
     # post overall health card) — موتور سلامت و خودتعمیر
     asyncio.create_task(health_engine_loop())
+    # Item 3: linkdooni engine — periodic stats card + relaunch if it was
+    # enabled before the restart.
+    asyncio.create_task(linkdooni_summary_loop())
     await recover_extras()
+    await recover_linkdooni()
     try:
         await bot.run_until_disconnected()
     finally:
@@ -4480,11 +4521,14 @@ async def contacts_menu_cb(event):
     rows = [[Button.inline(f"📇 {a['phone']}", f"cadd_{a['id']}".encode())]
             for a in accounts]
     rows.append([Button.inline(f"⏱ سرعت فعلی: {db.get_contact_delay()}s", b"cspeed")])
+    rows.append([Button.inline("🔎 کشف دوست با پیش‌شماره", b"discover")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     await safe_edit(event,
         "➕ افزودن مخاطب با فایل txt\n"
         f"{LINE}\nیک اکانت انتخاب کن، بعد فایل شماره‌ها رو بفرست.\n"
-        "هر خط: یک شماره (اختیاری: «شماره,اسم»).", buttons=rows)
+        "هر خط: یک شماره (اختیاری: «شماره,اسم»).\n"
+        "یا «🔎 کشف دوست با پیش‌شماره» رو بزن تا ربات خودش شماره‌های روبیکادار پیدا کنه.",
+        buttons=rows)
 
 
 @bot.on(events.CallbackQuery(data=b"cspeed"))
@@ -4542,7 +4586,19 @@ async def handle_contacts_file(event, st):
     asyncio.create_task(run_contact_import(event.sender_id, acc, pairs))
 
 
-async def _contacts_add_local(phone, pairs, delay, log_every, tag=""):
+async def _ctl_gate(ctl) -> bool:
+    """Honor an optional live control dict (Item 1/2). Returns True if the job
+    must STOP. Blocks here while it is PAUSED. ``ctl`` may be None."""
+    if not ctl:
+        return False
+    if ctl.get("stop"):
+        return True
+    while ctl.get("pause") and not ctl.get("stop"):
+        await asyncio.sleep(0.5)
+    return bool(ctl.get("stop"))
+
+
+async def _contacts_add_local(phone, pairs, delay, log_every, tag="", ctl=None):
     async def _do(client):
         added = 0        # on Rubika (real contact)
         not_user = 0     # added to address book but no Rubika account
@@ -4550,6 +4606,8 @@ async def _contacts_add_local(phone, pairs, delay, log_every, tag=""):
         attempt_fail = 0
         guids = []
         for ph, name in pairs:
+            if await _ctl_gate(ctl):          # live stop/pause (Item 1)
+                break
             try:
                 r = await asyncio.wait_for(
                     rb.add_contact(client, ph, name or config.CONTACT_DEFAULT_FIRST),
@@ -4571,6 +4629,11 @@ async def _contacts_add_local(phone, pairs, delay, log_every, tag=""):
                         f"🕒 {now()}"]))
                     await asyncio.sleep(db.get_resume_wait())
                     attempt_fail = 0
+            if ctl is not None:               # feed the live progress card
+                ctl["added"] = added
+                ctl["not_user"] = not_user
+                ctl["failed"] = failed
+                ctl["done"] = added + not_user + failed
             if log_every > 0 and (added + not_user + failed) % log_every == 0:
                 await log(card("📇 افزودن مخاطب — پیشرفت", [
                     f"{tag}📱 {phone}",
@@ -4582,55 +4645,586 @@ async def _contacts_add_local(phone, pairs, delay, log_every, tag=""):
     return await account_conn.call(phone, _do, timeout=14400)
 
 
-async def _contacts_add(acc, pairs, delay, tag=""):
+async def _contacts_add(acc, pairs, delay, tag="", ctl=None):
     """Add contacts on local OR remote account. Returns dict with
-    added (on Rubika) / not_user / failed / guids."""
+    added (on Rubika) / not_user / failed / guids.
+
+    When ``ctl`` is given (Item 1 live progress), the REMOTE path is driven in
+    chunks so pause/stop stay responsive and the progress card updates between
+    chunks instead of waiting for the whole list to finish on the worker."""
     phone = acc["phone"]
     w = worker.worker_for_account(acc)
     if w and not worker.is_local(w):
-        res = await worker.api_call(w, "POST", "/contacts/add", {
-            "phone": phone, "numbers": [p for p, _n in pairs],
-            "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
-        }, timeout=14400)
-        if not res.get("ok"):
-            raise RuntimeError(res.get("error", "contacts add failed"))
-        return {"added": res.get("added", 0), "not_user": res.get("not_user", 0),
-                "failed": res.get("failed", 0), "guids": res.get("guids", [])}
-    return await _contacts_add_local(phone, pairs, delay, config.CONTACT_LOG_EVERY, tag)
+        if ctl is None:
+            res = await worker.api_call(w, "POST", "/contacts/add", {
+                "phone": phone, "numbers": [p for p, _n in pairs],
+                "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
+            }, timeout=14400)
+            if not res.get("ok"):
+                raise RuntimeError(res.get("error", "contacts add failed"))
+            return {"added": res.get("added", 0), "not_user": res.get("not_user", 0),
+                    "failed": res.get("failed", 0), "guids": res.get("guids", [])}
+        # chunked remote add with live control
+        added = not_user = failed = 0
+        guids = []
+        chunk = max(1, config.CONTACT_REMOTE_CHUNK)
+        for i in range(0, len(pairs), chunk):
+            if await _ctl_gate(ctl):
+                break
+            part = pairs[i:i + chunk]
+            res = await worker.api_call(w, "POST", "/contacts/add", {
+                "phone": phone, "numbers": [p for p, _n in part],
+                "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
+            }, timeout=14400)
+            if not res.get("ok"):
+                raise RuntimeError(res.get("error", "contacts add failed"))
+            added += res.get("added", 0)
+            not_user += res.get("not_user", 0)
+            failed += res.get("failed", 0)
+            guids.extend(res.get("guids", []) or [])
+            ctl["added"] = added
+            ctl["not_user"] = not_user
+            ctl["failed"] = failed
+            ctl["done"] = added + not_user + failed
+        return {"added": added, "not_user": not_user, "failed": failed, "guids": guids}
+    return await _contacts_add_local(phone, pairs, delay, config.CONTACT_LOG_EVERY,
+                                     tag, ctl=ctl)
+
+
+def _ctl_buttons(aid: int, kind: str = "c"):
+    """Stop/pause/resume buttons for a live job. kind 'c' = contact import,
+    'd' = discovery (so the two never clash)."""
+    paused_row = [Button.inline("▶️ ادامه", f"{kind}resume_{aid}".encode()),
+                  Button.inline("⏹ توقف", f"{kind}stop_{aid}".encode())]
+    running_row = [Button.inline("⏸ مکث", f"{kind}pause_{aid}".encode()),
+                   Button.inline("⏹ توقف", f"{kind}stop_{aid}".encode())]
+    return [paused_row], [running_row]
+
+
+def _contact_progress_card(ctl) -> str:
+    total = ctl.get("total", 0)
+    done = ctl.get("done", 0)
+    pct = int(done * 100 / total) if total else 0
+    status = "⏸ مکث" if ctl.get("pause") else ("⏹ در حال توقف" if ctl.get("stop")
+                                                else "🟢 در حال اجرا")
+    return card("📇 افزودن مخاطب — پیشرفت زنده", [
+        f"📱 {ctl.get('phone', '')}",
+        f"وضعیت : {status}",
+        f"📊 {done} از {total} — {pct}%",
+        f"🟢 روبیکادار : {ctl.get('added', 0)}   "
+        f"📵 بدون‌روبیکا : {ctl.get('not_user', 0)}   ❌ {ctl.get('failed', 0)}",
+        f"🕒 {now()}",
+    ])
+
+
+async def _contact_progress_loop(owner_id: int, aid: int, ctl: dict, msg):
+    """Edit the live progress message every CONTACT_PROGRESS_EVERY seconds until
+    the job is marked finished."""
+    while not ctl.get("finished"):
+        paused_btns, running_btns = _ctl_buttons(aid, "c")
+        try:
+            await safe_edit(msg, _contact_progress_card(ctl),
+                            buttons=paused_btns if ctl.get("pause") else running_btns)
+        except Exception:
+            pass
+        await asyncio.sleep(max(1.0, config.CONTACT_PROGRESS_EVERY))
 
 
 async def run_contact_import(owner_id: int, acc, pairs):
     phone = acc["phone"]
+    aid = acc["id"]
     delay = db.get_contact_delay()
+    ctl = {"stop": False, "pause": False, "added": 0, "not_user": 0,
+           "failed": 0, "total": len(pairs), "done": 0, "phone": phone,
+           "finished": False}
+    contact_jobs[aid] = ctl
     await log(card("📇 CONTACT IMPORT START", [
         f"📱 {phone}", f"🎯 شماره‌ها : {len(pairs)}", f"⏱ سرعت : {delay}s", f"🕒 {now()}"]))
+    _, running_btns = _ctl_buttons(aid, "c")
     try:
-        res = await _contacts_add(acc, pairs, delay)
+        msg = await bot.send_message(owner_id, _contact_progress_card(ctl),
+                                     buttons=running_btns)
+    except Exception:
+        msg = None
+    prog_task = None
+    if msg is not None:
+        prog_task = asyncio.create_task(_contact_progress_loop(owner_id, aid, ctl, msg))
+    try:
+        res = await _contacts_add(acc, pairs, delay, ctl=ctl)
     except account_conn.InvalidAuthError:
-        db.set_status(acc["id"], "inactive")
+        db.set_status(aid, "inactive")
+        ctl["finished"] = True
+        contact_jobs.pop(aid, None)
+        if prog_task:
+            prog_task.cancel()
         await log(card("📇 CONTACT IMPORT — سشن باطل", [f"📱 {phone}", f"🕒 {now()}"]))
         await bot.send_message(owner_id, f"🔴 سشن {phone} باطله. دوباره اضافه‌اش کن.")
         return
     except Exception as e:  # noqa: BLE001
+        ctl["finished"] = True
+        contact_jobs.pop(aid, None)
+        if prog_task:
+            prog_task.cancel()
         await log(card("📇 CONTACT IMPORT — خطا", [
             f"📱 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
         await bot.send_message(owner_id, f"❌ افزودن مخاطب ناموفق: {repr(e)[:120]}")
         return
+    ctl["finished"] = True
+    if prog_task:
+        prog_task.cancel()
+    stopped = ctl.get("stop")
+    contact_jobs.pop(aid, None)
     added = res.get("added", 0)
     not_user = res.get("not_user", 0)
     failed = res.get("failed", 0)
-    await log(card("📇 CONTACT IMPORT FINISHED ✅", [
+    title = "📇 CONTACT IMPORT STOPPED ⏹" if stopped else "📇 CONTACT IMPORT FINISHED ✅"
+    await log(card(title, [
         f"📱 {phone}",
         f"🟢 روی روبیکا اضافه شد : {added}",
         f"📵 روبیکا نداشت : {not_user}",
         f"❌ ناموفق : {failed}",
         f"📦 کل : {len(pairs)}",
         f"🕒 {now()}"]))
+    if msg is not None:
+        try:
+            await safe_edit(msg, _contact_progress_card(ctl),
+                            buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+        except Exception:
+            pass
     await bot.send_message(owner_id,
-        f"✅ {added} مخاطبِ روبیکادار به اکانت {phone} اضافه شد.\n"
-        f"📵 بدون روبیکا: {not_user}   ❌ ناموفق: {failed}\n"
-        "(فقط شماره‌هایی که روبیکا دارن به‌عنوان مخاطب نشون داده می‌شن.)",
+        ("⏹ افزودن مخاطب متوقف شد. " if stopped else "✅ افزودن مخاطب تمام شد. ")
+        + f"\n🟢 روبیکادار: {added}   📵 بدون روبیکا: {not_user}   ❌ ناموفق: {failed}",
         buttons=main_menu(owner_id == config.OWNER_ID))
+
+
+# ---- Item 1: live contact-import controls (stop / pause / resume) ----
+@bot.on(events.CallbackQuery(pattern=b"cstop_(\\d+)"))
+async def contact_stop_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    ctl = contact_jobs.get(aid)
+    if not ctl:
+        await event.answer("کاری برای توقف نیست.", alert=True)
+        return
+    ctl["stop"] = True
+    ctl["pause"] = False
+    await event.answer("⏹ توقف ثبت شد. بعد از مخاطب جاری متوقف می‌شود.", alert=True)
+
+
+@bot.on(events.CallbackQuery(pattern=b"cpause_(\\d+)"))
+async def contact_pause_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    ctl = contact_jobs.get(aid)
+    if not ctl:
+        await event.answer("کاری برای مکث نیست.", alert=True)
+        return
+    ctl["pause"] = True
+    await event.answer("⏸ مکث شد.")
+
+
+@bot.on(events.CallbackQuery(pattern=b"cresume_(\\d+)"))
+async def contact_resume_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    ctl = contact_jobs.get(aid)
+    if not ctl:
+        await event.answer("کاری برای ادامه نیست.", alert=True)
+        return
+    ctl["pause"] = False
+    await event.answer("▶️ ادامه یافت.")
+
+
+# --------------------------------------------------------------------------- #
+# Item 2: prefix-based contact-discovery engine (موتور کشف دوست با پیش‌شماره)
+# Used by BOTH «➕ افزودن مخاطب» (single account) and «🧠 مغز» (the selected
+# fleet). The user gives a prefix of ANY length (e.g. 0913 or 09135646); the
+# bot fills the rest of the 11 digits at random, probes them via add_contact
+# until DISCOVERY_TARGET (150) Rubika-having numbers are found, keeps a simple
+# anti-repeat ledger (leeched_numbers), then feeds the found guids straight into
+# the send pipeline in either 'marker' or 'text' mode.
+# --------------------------------------------------------------------------- #
+def _clean_prefix(raw: str):
+    """Normalise a user-supplied prefix into a 0-leading mobile prefix (<=11)."""
+    digits = _re_u.sub(r"\D", "", raw or "")
+    if not digits:
+        return None
+    if digits.startswith("98"):
+        digits = "0" + digits[2:]
+    if not digits.startswith("0"):
+        digits = "0" + digits
+    return digits[:11]
+
+
+def _gen_number(prefix: str) -> str:
+    need = 11 - len(prefix)
+    suffix = "".join(random.choice("0123456789") for _ in range(max(0, need)))
+    return prefix + suffix
+
+
+def _next_candidate(prefix: str, session_seen: set):
+    """Return (display_number, normalized) that is NOT already leeched/seen."""
+    for _ in range(300):
+        num = _gen_number(prefix)
+        norm = rb.normalize_phone(num)
+        if not norm or norm in session_seen:
+            continue
+        session_seen.add(norm)
+        if db.was_leeched(norm):
+            continue
+        return num, norm
+    return None, None
+
+
+def _discovery_card(ctl) -> str:
+    status = "⏸ مکث" if ctl.get("pause") else ("⏹ در حال توقف" if ctl.get("stop")
+                                                else "🟢 در حال جستجو")
+    target = ctl.get("target", 0)
+    found = ctl.get("found", 0)
+    pct = int(found * 100 / target) if target else 0
+    return card("🔎 کشف دوست با پیش‌شماره — زنده", [
+        f"📱 {ctl.get('phone', '')}",
+        f"☎️ پیش‌شماره : {ctl.get('prefix', '')}",
+        f"وضعیت : {status}",
+        f"🎯 پیداشده : {found} از {target} — {pct}%",
+        f"🔍 پروب‌شده : {ctl.get('probed', 0)}",
+        f"🕒 {now()}",
+    ])
+
+
+async def _discovery_progress_loop(aid: int, ctl: dict, msg):
+    while not ctl.get("finished"):
+        paused_btns, running_btns = _ctl_buttons(aid, "c")  # reuse contact controls
+        try:
+            await safe_edit(msg, _discovery_card(ctl),
+                            buttons=paused_btns if ctl.get("pause") else running_btns)
+        except Exception:
+            pass
+        await asyncio.sleep(max(1.0, config.CONTACT_PROGRESS_EVERY))
+
+
+async def _discover_for_account(acc, prefix, target, ctl, tag=""):
+    """Probe random numbers built from `prefix` until `target` Rubika-having
+    guids are found (or attempts/stop). Returns the list of found guids."""
+    phone = acc["phone"]
+    delay = config.DISCOVERY_PROBE_DELAY
+    max_attempts = config.DISCOVERY_MAX_ATTEMPTS
+    session_seen: set = set()
+    w = worker.worker_for_account(acc)
+
+    if w and not worker.is_local(w):
+        # remote: probe in chunks via the existing /contacts/add endpoint.
+        found = []
+        probed = 0
+        chunk = max(1, config.CONTACT_REMOTE_CHUNK)
+        while len(found) < target and probed < max_attempts:
+            if await _ctl_gate(ctl):
+                break
+            nums = []
+            for _ in range(chunk):
+                disp, norm = _next_candidate(prefix, session_seen)
+                if not disp:
+                    break
+                nums.append((disp, norm))
+            if not nums:
+                break
+            res = await worker.api_call(w, "POST", "/contacts/add", {
+                "phone": phone, "numbers": [d for d, _n in nums],
+                "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
+            }, timeout=7200)
+            if not res.get("ok"):
+                raise RuntimeError(res.get("error", "discovery probe failed"))
+            probed += len(nums)
+            for _d, norm in nums:
+                db.mark_leeched(norm, False)
+            for g in (res.get("guids", []) or []):
+                if g not in found:
+                    found.append(g)
+            ctl["found"] = len(found)
+            ctl["probed"] = probed
+        return found[:target]
+
+    # local: probe one-by-one so the ledger + live counter are exact.
+    async def _do(client):
+        found = []
+        probed = 0
+        attempt_fail = 0
+        while len(found) < target and probed < max_attempts:
+            if await _ctl_gate(ctl):
+                break
+            disp, norm = _next_candidate(prefix, session_seen)
+            if not disp:
+                break
+            probed += 1
+            try:
+                r = await asyncio.wait_for(
+                    rb.add_contact(client, disp, config.CONTACT_DEFAULT_FIRST),
+                    timeout=config.SEND_TIMEOUT)
+                attempt_fail = 0
+                on_r = bool(r.get("on_rubika"))
+                db.mark_leeched(norm, on_r)
+                if on_r and r.get("guid") and r["guid"] not in found:
+                    found.append(r["guid"])
+            except Exception:
+                attempt_fail += 1
+                if attempt_fail >= db.get_max_errors():
+                    await log(card("🔎 کشف دوست — وقفه", [
+                        f"{tag}📱 {phone}",
+                        f"{db.get_max_errors()} خطای پشت‌سرهم → صبر {db.get_resume_wait()}s",
+                        f"🕒 {now()}"]))
+                    await asyncio.sleep(db.get_resume_wait())
+                    attempt_fail = 0
+            ctl["found"] = len(found)
+            ctl["probed"] = probed
+            await asyncio.sleep(max(0.0, float(delay)))
+        return found[:target]
+
+    return await account_conn.call(phone, _do, timeout=86400)
+
+
+async def _send_to_guids(owner_id, acc, guids, mode, text, tag=""):
+    """Send to a fixed list of guids in 'marker' or 'text' mode. Returns
+    (ok, fail). Reuses run_send locally; uses /send/to_list remotely."""
+    if not guids:
+        return 0, 0
+    phone = acc["phone"]
+    aid = acc["id"]
+    delay = db.get_delay()
+    marker = db.get_marker()
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/send/to_list", {
+            "phone": phone, "marker": marker, "guids": guids, "delay": delay,
+            "max_errors": db.get_max_errors(), "send_timeout": config.SEND_TIMEOUT,
+            "mode": mode, "text": text}, timeout=14400)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error", "send failed"))
+        return res.get("sent", 0), res.get("fail", 0)
+    # local
+    saved_guid = mid = None
+    if mode != "text":
+        saved_guid, mid = await _find_marker_local(phone, marker)
+        if not mid:
+            await log(card("🔎 کشف — مارکر پیدا نشد", [f"{tag}📱 {phone}"]))
+            return 0, 0
+    r = await run_send(owner_id, {
+        "account_id": aid, "phone": phone, "saved_guid": saved_guid, "mid": mid,
+        "recipients": guids, "tag": tag, "suppress_resume_panel": True,
+        "mode": mode, "text": text})
+    return (r or {}).get("ok", 0), (r or {}).get("fail", 0)
+
+
+async def _run_discovery(owner_id, accounts, prefix, mode, text):
+    """Discover DISCOVERY_TARGET rubika-having numbers per account, then send to
+    them in the chosen mode, and report the success rate."""
+    target = config.DISCOVERY_TARGET
+    for i, a in enumerate(accounts, 1):
+        a["_tag"] = f"#A{i}" if len(accounts) > 1 else ""
+    await log(card("🔎 DISCOVERY START", [
+        f"☎️ پیش‌شماره : {prefix}",
+        f"👥 اکانت‌ها : {len(accounts)}",
+        f"🎯 هدف هر اکانت : {target} روبیکادار",
+        f"✍️ حالت ارسال : {'متن دلخواه' if mode == 'text' else 'مارکر'}",
+        f"🕒 {now()}"]))
+    grand_ok = grand_fail = grand_found = 0
+    for acc in accounts:
+        aid = acc["id"]
+        phone = acc["phone"]
+        tag = (acc.get("_tag") or "")
+        ltag = (tag + " ") if tag else ""
+        ctl = {"stop": False, "pause": False, "found": 0, "probed": 0,
+               "target": target, "phone": phone, "prefix": prefix,
+               "finished": False}
+        contact_jobs[aid] = ctl
+        _, running_btns = _ctl_buttons(aid, "c")
+        try:
+            msg = await bot.send_message(owner_id, _discovery_card(ctl),
+                                         buttons=running_btns)
+        except Exception:
+            msg = None
+        prog = asyncio.create_task(_discovery_progress_loop(aid, ctl, msg)) if msg else None
+        try:
+            guids = await _discover_for_account(acc, prefix, target, ctl, tag=ltag)
+        except account_conn.InvalidAuthError:
+            db.set_status(aid, "inactive")
+            ctl["finished"] = True
+            if prog:
+                prog.cancel()
+            contact_jobs.pop(aid, None)
+            await log(card("🔎 کشف — سشن باطل", [f"{ltag}📱 {phone}", f"🕒 {now()}"]))
+            continue
+        except Exception as e:  # noqa: BLE001
+            ctl["finished"] = True
+            if prog:
+                prog.cancel()
+            contact_jobs.pop(aid, None)
+            await log(card("🔎 کشف — خطا", [
+                f"{ltag}📱 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
+            continue
+        ctl["finished"] = True
+        if prog:
+            prog.cancel()
+        contact_jobs.pop(aid, None)
+        grand_found += len(guids)
+        await log(card("🔎 کشف — پایان اکانت", [
+            f"{ltag}📱 {phone}",
+            f"🎯 پیداشده : {len(guids)} روبیکادار",
+            f"🔍 پروب‌شده : {ctl.get('probed', 0)}",
+            f"🕒 {now()}"]))
+        if not guids:
+            continue
+        # straight into the send pipeline (Item 2 wiring)
+        try:
+            ok, fail = await _send_to_guids(owner_id, acc, guids, mode, text, tag=ltag)
+            grand_ok += ok
+            grand_fail += fail
+        except account_conn.InvalidAuthError:
+            db.set_status(aid, "inactive")
+            await log(card("🔎 ارسال — سشن باطل", [f"{ltag}📱 {phone}"]))
+        except Exception as e:  # noqa: BLE001
+            await log(card("🔎 ارسال — خطا", [f"{ltag}📱 {phone}", f"💥 {repr(e)[:140]}"]))
+    attempted = grand_ok + grand_fail
+    pct = int(grand_ok * 100 / attempted) if attempted else 0
+    await log(card("🏁 DISCOVERY — پایان", [
+        f"🎯 مجموع پیداشده : {grand_found} روبیکادار",
+        f"✅ ارسال موفق : {grand_ok}   ❌ ناموفق : {grand_fail}",
+        f"📈 نرخ موفقیت : {pct}%",
+        f"🕒 {now()}"]))
+    try:
+        await bot.send_message(owner_id, card("🔎 کشف دوست تمام شد ✅", [
+            f"🎯 پیداشده : {grand_found} روبیکادار",
+            f"✅ ارسال موفق : {grand_ok}   ❌ ناموفق : {grand_fail}",
+            f"📈 نرخ موفقیت : {pct}%"]),
+            buttons=main_menu(owner_id == config.OWNER_ID))
+    except Exception:
+        pass
+
+
+def _discovery_mode_buttons():
+    return [[Button.inline("📌 ارسال مارکر", b"dmode_marker"),
+             Button.inline("✍️ متن دلخواه", b"dmode_text")],
+            [Button.inline("🔙 لغو", b"home")]]
+
+
+# ----- entry from «➕ افزودن مخاطب»: pick ONE account, then prefix -----
+@bot.on(events.CallbackQuery(data=b"discover"))
+async def discover_menu_cb(event):
+    if not is_owner(event):
+        return
+    accounts = db.list_accounts()
+    if not accounts:
+        await event.answer("اول یک اکانت اضافه کن.", alert=True)
+        return
+    rows = [[Button.inline(f"🔎 {a['phone']}", f"dpick_{a['id']}".encode())]
+            for a in accounts]
+    rows.append([Button.inline("🔙 بازگشت", b"contacts")])
+    await safe_edit(event,
+        "🔎 کشف دوست با پیش‌شماره\n"
+        f"{LINE}\nیک اکانت انتخاب کن، بعد پیش‌شماره رو بفرست.\n"
+        f"ربات تا پیدا کردن {config.DISCOVERY_TARGET} شماره‌ی روبیکادار ادامه می‌ده.",
+        buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"dpick_(\\d+)"))
+async def discover_pick_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    state[event.sender_id] = {"step": "await_discover_prefix", "ids": [aid]}
+    await safe_edit(event,
+        f"☎️ پیش‌شماره رو برای اکانت {acc['phone']} بفرست.\n"
+        "مثال: `0913` یا `09135646` (هر طولی — بقیه رندوم پر می‌شه).",
+        buttons=[[Button.inline("🔙 لغو", b"contacts")]])
+
+
+@bot.on(events.CallbackQuery(data=b"bdiscover"))
+async def brain_discover_cb(event):
+    """Entry from «🧠 مغز»: discover for the whole selected fleet."""
+    if not is_owner(event):
+        return
+    sel = list(brain_sel.get(event.sender_id, set()))
+    if not sel:
+        await event.answer("اول حداقل یک اکانت انتخاب کن.", alert=True)
+        return
+    state[event.sender_id] = {"step": "await_discover_prefix", "ids": sel}
+    await safe_edit(event,
+        f"☎️ پیش‌شماره رو بفرست. هر کدوم از {len(sel)} اکانت تا "
+        f"{config.DISCOVERY_TARGET} شماره‌ی روبیکادار پیدا و ارسال می‌کنه.\n"
+        "مثال: `0913` یا `09135646`.",
+        buttons=[[Button.inline("🔙 لغو", b"brain")]])
+
+
+async def handle_discover_prefix(event, st):
+    prefix = _clean_prefix(event.raw_text.strip())
+    if not prefix or len(prefix) < 2 or len(prefix) > 11:
+        await event.respond("پیش‌شماره نامعتبره. یه چیزی مثل `0913` بفرست.")
+        return
+    if len(prefix) == 11:
+        await event.respond("این یه شماره‌ی کامله، نه پیش‌شماره. یه پیش‌شماره‌ی کوتاه‌تر بده.")
+        return
+    st["prefix"] = prefix
+    st["step"] = "await_discover_mode"
+    await event.respond(
+        f"☎️ پیش‌شماره: `{prefix}`\nحالا حالت ارسال به شماره‌های پیداشده رو انتخاب کن:",
+        buttons=_discovery_mode_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"dmode_marker"))
+async def discover_mode_marker_cb(event):
+    if not is_owner(event):
+        return
+    st = state.get(event.sender_id) or {}
+    if st.get("step") != "await_discover_mode":
+        await event.answer("منقضی شده. دوباره شروع کن.", alert=True)
+        return
+    ids = st.get("ids") or []
+    prefix = st.get("prefix")
+    state.pop(event.sender_id, None)
+    accounts = [a for a in (db.get_account(i) for i in ids) if a]
+    if not accounts or not prefix:
+        await event.answer("اطلاعات ناقصه.", alert=True)
+        return
+    await safe_edit(event, "🔎 کشف دوست شروع شد (حالت: مارکر). گزارش‌ها تو گروه لاگ میاد.",
+                    buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+    asyncio.create_task(_run_discovery(event.sender_id, accounts, prefix, "marker", ""))
+
+
+@bot.on(events.CallbackQuery(data=b"dmode_text"))
+async def discover_mode_text_cb(event):
+    if not is_owner(event):
+        return
+    st = state.get(event.sender_id) or {}
+    if st.get("step") != "await_discover_mode":
+        await event.answer("منقضی شده. دوباره شروع کن.", alert=True)
+        return
+    st["step"] = "await_discover_text"
+    await safe_edit(event, "✍️ متنی که می‌خوای به شماره‌های پیداشده فرستاده بشه رو بفرست:",
+                    buttons=[[Button.inline("🔙 لغو", b"home")]])
+
+
+async def handle_discover_text(event, st):
+    text = event.raw_text.strip()
+    if not text:
+        await event.respond("متن نمی‌تونه خالی باشه. دوباره بفرست.")
+        return
+    ids = st.get("ids") or []
+    prefix = st.get("prefix")
+    state.pop(event.sender_id, None)
+    accounts = [a for a in (db.get_account(i) for i in ids) if a]
+    if not accounts or not prefix:
+        await event.respond("اطلاعات ناقصه. دوباره شروع کن.",
+                            buttons=main_menu(is_real_owner(event)))
+        return
+    await event.respond("🔎 کشف دوست شروع شد (حالت: متن دلخواه). گزارش‌ها تو گروه لاگ میاد.",
+                        buttons=main_menu(is_real_owner(event)))
+    asyncio.create_task(_run_discovery(event.sender_id, accounts, prefix, "text", text))
 
 
 # --------------------------------------------------------------------------- #
@@ -4844,6 +5438,7 @@ def _brain_menu(owner_id):
         mark = "✅" if a["id"] in sel else "⬜️"
         rows.append([Button.inline(f"{mark} {a['phone']}", f"bsel_{a['id']}".encode())])
     rows.append([Button.inline("📂 آپلود فایل شماره و شروع", b"bfile")])
+    rows.append([Button.inline("🔎 کشف دوست با پیش‌شماره", b"bdiscover")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     return rows
 
@@ -5079,6 +5674,631 @@ async def _find_marker_local(phone, marker):
             await client.disconnect()
         except Exception:
             pass
+
+
+# =========================================================================== #
+# Item 3: linkdooni engine (موتور لینکدونی)
+#   • harvest GROUP invite links from "linkdooni" channels,
+#   • discover up to N NEW groups/day (grand total), split round-robin across
+#     the selected fleet, each account joins its share,
+#   • send the configured texts into those groups at a per-account interval,
+#   • auto-replace an account that gets banned/muted in a group with a free one,
+#   • run the PV secretary alongside,
+#   • post a per-account stats card every LINKDOONI_SUMMARY_INTERVAL,
+#   • a single stop button shuts the whole engine down.
+# Works for local accounts (full: send + ban-replacement) and remote/worker
+# accounts (join + scheduled send via the worker /linkdooni endpoints).
+# =========================================================================== #
+def _ld_fleet_accounts() -> list:
+    out = []
+    for aid in db.list_linkdooni_account_ids():
+        a = db.get_account(aid)
+        if a and a.get("status") == "active":
+            out.append(a)
+    return out
+
+
+def _ld_pick_reader(fleet: list):
+    """Prefer a local account to read channels; fall back to the first one."""
+    for a in fleet:
+        w = worker.worker_for_account(a)
+        if not w or worker.is_local(w):
+            return a
+    return fleet[0] if fleet else None
+
+
+async def _ld_extract_links(reader, channels: list, want: int) -> list:
+    """Harvest group invite links from the channels using `reader`'s session."""
+    phone = reader["phone"]
+    w = worker.worker_for_account(reader)
+    refs = [c["ref"] for c in channels]
+    if w and not worker.is_local(w):
+        try:
+            res = await worker.api_call(w, "POST", "/linkdooni/extract", {
+                "phone": phone, "channels": refs,
+                "scan": config.LINKDOONI_CHANNEL_SCAN}, timeout=600)
+            return res.get("links", []) or []
+        except Exception:
+            return []
+    links = []
+    async with account_conn.connection(phone) as client:
+        for ref in refs:
+            if len(links) >= want * 3:        # gather a healthy surplus
+                break
+            try:
+                guid, _title = await asyncio.wait_for(
+                    rb.resolve_channel(client, ref), timeout=60)
+            except Exception:
+                continue
+            try:
+                msgs = await asyncio.wait_for(
+                    rb.get_recent_messages(client, guid, config.LINKDOONI_CHANNEL_SCAN),
+                    timeout=90)
+            except Exception:
+                msgs = []
+            for m in msgs:
+                for lk in rb.extract_group_links(rb._msg_text_of(m)):
+                    if lk not in links:
+                        links.append(lk)
+    return links
+
+
+async def _ld_resolve_guid(reader, link: str):
+    """Best-effort: resolve a group invite link to its guid WITHOUT joining."""
+    phone = reader["phone"]
+    w = worker.worker_for_account(reader)
+    if w and not worker.is_local(w):
+        return None       # remote preview unsupported -> rely on join result
+    try:
+        async with account_conn.connection(phone) as client:
+            return await rb.get_group_guid_by_link(client, link)
+    except Exception:
+        return None
+
+
+async def _ld_join(acc, link: str):
+    """Join a group via link on `acc`. Returns the group guid (or None)."""
+    phone = acc["phone"]
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        try:
+            res = await worker.api_call(w, "POST", "/group/join",
+                                        {"phone": phone, "links": [link]}, timeout=120)
+            return None if not res.get("joined") else "joined"
+        except Exception:
+            return None
+    try:
+        async with account_conn.connection(phone) as client:
+            res = await asyncio.wait_for(rb.join_group_by_link(client, link), timeout=90)
+            return rb.join_result_group_guid(res)
+    except Exception:
+        return None
+
+
+async def _ld_discover_join():
+    """One discovery+join cycle, respecting the daily grand-total cap."""
+    cfg = db.get_linkdooni_config()
+    fleet = _ld_fleet_accounts()
+    channels = db.list_linkdooni_channels()
+    if not fleet or not channels:
+        return
+    daily = int(cfg.get("daily_groups") or config.LINKDOONI_DAILY_GROUPS)
+    remaining = daily - db.linkdooni_groups_today_count()
+    if remaining <= 0:
+        return
+    reader = _ld_pick_reader(fleet)
+    links = await _ld_extract_links(reader, channels, remaining)
+    # keep only NEW links (dedup ledger), cap to the remaining daily quota
+    new_links = []
+    for lk in links:
+        if len(new_links) >= remaining:
+            break
+        if db.linkdooni_seen_link(lk):
+            new_links.append(lk)
+    if not new_links:
+        await log(card("📨 لینکدونی — کشف", [
+            "گروه جدیدی پیدا نشد (یا سقف روزانه پر شده).", f"🕒 {now()}"]))
+        return
+    await log(card("📨 لینکدونی — کشف گروه", [
+        f"🔗 لینک جدید : {len(new_links)}",
+        f"📊 سقف روزانه باقی‌مانده : {remaining}",
+        f"👥 اکانت‌ها : {len(fleet)}", f"🕒 {now()}"]))
+    joined = 0
+    failed = 0
+    for i, lk in enumerate(new_links):
+        acc = fleet[i % len(fleet)]
+        guid = await _ld_resolve_guid(reader, lk)
+        joined_guid = await _ld_join(acc, lk)
+        if not guid:
+            guid = joined_guid if (joined_guid and joined_guid != "joined") else None
+        if not guid:
+            failed += 1
+            await log(card("📨 لینکدونی — guid پیدا نشد (رد شد)", [
+                f"📱 {acc['phone']}", f"🔗 {lk}",
+                "این بیلد روبیکا preview لینک رو نداد؛ این گروه رد شد.", f"🕒 {now()}"]))
+            continue
+        db.add_linkdooni_group(guid, lk, acc["id"])
+        db.mark_linkdooni_group_joined(guid, True)
+        db.incr_linkdooni_joined(acc["id"], 1)
+        joined += 1
+        await log(card("📨 لینکدونی — join", [
+            f"📱 {acc['phone']}", f"👥 {guid}", f"🔗 {lk}", f"🕒 {now()}"]))
+        await asyncio.sleep(config.GROUP_JOIN_DELAY)
+    await log(card("📨 لینکدونی — پایان کشف/join", [
+        f"✅ join شده : {joined}   ❌ ناموفق : {failed}", f"🕒 {now()}"]))
+    # (re)start senders so newly joined groups start receiving messages
+    for acc in fleet:
+        await _ld_start_sender(acc)
+
+
+async def _ld_replace(banned_acc, guid: str, name: str, link: str):
+    """A group banned/muted `banned_acc`: hand it to a free fleet account."""
+    fleet = _ld_fleet_accounts()
+    cand = None
+    for a in fleet:
+        if a["id"] != banned_acc["id"]:
+            cand = a
+            break
+    # record the ban for the cleanup engine (same as automation does)
+    try:
+        is_new = db.add_cleanup_candidate(banned_acc["id"], guid, name,
+                                          reason="بن/سکوت در گروه لینکدونی")
+        if is_new:
+            await _log_cleanup_candidate(banned_acc["id"], banned_acc["phone"], guid, name)
+    except Exception:
+        pass
+    if not cand:
+        db.mark_linkdooni_group_joined(guid, False)
+        await log(card("📨 لینکدونی — جایگزین نبود", [
+            f"📱 {banned_acc['phone']} در گروه بن شد ولی اکانت آزادی نیست.",
+            f"👥 {guid}", f"🕒 {now()}"]))
+        return
+    db.reassign_linkdooni_group(guid, cand["id"])
+    joined_guid = await _ld_join(cand, link)
+    if joined_guid:
+        db.mark_linkdooni_group_joined(guid, True)
+        db.incr_linkdooni_joined(cand["id"], 1)
+        await log(card("📨 لینکدونی — جایگزینی اکانت", [
+            f"🚫 {banned_acc['phone']} بن شد",
+            f"✅ جایگزین : {cand['phone']}",
+            f"👥 {guid}", f"🕒 {now()}"]))
+        await _ld_start_sender(cand)        # make sure replacement is sending
+    else:
+        await log(card("📨 لینکدونی — جایگزین join نشد", [
+            f"✅ جایگزین : {cand['phone']} نتونست join کنه",
+            f"👥 {guid}", f"🕒 {now()}"]))
+
+
+async def _run_linkdooni_local(account_id: int, phone: str, st: dict):
+    """Local linkdooni send loop — ONE connection per pass. Reads the account's
+    assigned+joined groups FRESH each pass (so reassignments are picked up),
+    sends a random configured text to each, and triggers auto-replacement when a
+    group bans/mutes the account (3 strikes)."""
+    fails: dict = {}
+    last_text: dict = {}
+    try:
+        while not st.get("stop"):
+            st["heartbeat"] = time.monotonic()
+            texts = db.list_linkdooni_texts()
+            interval = (db.get_linkdooni_config().get("send_interval")
+                        or config.LINKDOONI_SEND_INTERVAL)
+            if texts:
+                try:
+                    async with account_conn.connection(phone) as client:
+                        groups = db.list_linkdooni_groups(account_id, joined_only=True)
+                        st["groups"] = len(groups)
+                        for g in groups:
+                            if st.get("stop"):
+                                break
+                            guid = g["group_guid"]
+                            idx, txt = _pick_text(texts, last_text.get(guid))
+                            if txt is None:
+                                break
+                            try:
+                                await asyncio.wait_for(
+                                    rb.send_text(client, guid, txt),
+                                    timeout=config.SEND_TIMEOUT)
+                                st["sent"] = st.get("sent", 0) + 1
+                                last_text[guid] = idx
+                                fails[guid] = 0
+                                try:
+                                    db.incr_linkdooni_sent(account_id, 1)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                fails[guid] = fails.get(guid, 0) + 1
+                                if fails[guid] >= 3:
+                                    acc = db.get_account(account_id)
+                                    if acc:
+                                        try:
+                                            await _ld_replace(acc, guid,
+                                                              g.get("name", ""),
+                                                              g.get("link", ""))
+                                        except Exception:
+                                            pass
+                                    fails[guid] = 0
+                            await asyncio.sleep(random.uniform(
+                                config.LINKDOONI_GROUP_DELAY_MIN,
+                                config.LINKDOONI_GROUP_DELAY_MAX))
+                except Exception as e:  # noqa: BLE001
+                    account_conn.drop_connection(phone)
+                    if account_conn.is_auth_error(e):
+                        await log(f"⚠️ لینکدونی «{phone}» خطای auth (ادامه): {repr(e)[:120]}")
+            st["heartbeat"] = time.monotonic()
+            waited = 0
+            while waited < interval and not st.get("stop"):
+                await asyncio.sleep(1)
+                waited += 1
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ لینکدونی «{phone}» متوقف شد: {repr(e)[:140]}")
+
+
+async def _ld_start_sender(acc):
+    """Start/refresh the linkdooni send loop for one account (local or remote)."""
+    aid = acc["id"]
+    phone = acc["phone"]
+    interval = config.clamp_linkdooni_interval(
+        db.get_linkdooni_config().get("send_interval"))
+    texts = db.list_linkdooni_texts()
+    groups = db.list_linkdooni_groups(aid, joined_only=True)
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        if not texts or not groups:
+            return
+        try:
+            await worker.api_call(w, "POST", "/linkdooni/start", {
+                "phone": phone,
+                "group_guids": [g["group_guid"] for g in groups],
+                "texts": texts, "interval": interval}, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ لینکدونی ریموت {phone} استارت نشد: {repr(e)[:120]}")
+        return
+    # local: (re)start the task only if it is not already running
+    t = linkdooni_tasks.get(aid)
+    if t and not t["task"].done():
+        return
+    stx = {"stop": False, "sent": (t["state"].get("sent", 0) if t else 0),
+           "groups": 0, "heartbeat": time.monotonic()}
+    task = asyncio.create_task(_run_linkdooni_local(aid, phone, stx))
+    linkdooni_tasks[aid] = {"task": task, "state": stx}
+
+
+async def _ld_stop_sender(acc):
+    aid = acc["id"]
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        try:
+            await worker.api_call(w, "POST", "/linkdooni/stop", {"phone": acc["phone"]})
+        except Exception:
+            pass
+        return
+    t = linkdooni_tasks.pop(aid, None)
+    if t:
+        t["state"]["stop"] = True
+        task = t.get("task")
+        if task and not task.done():
+            task.cancel()
+
+
+async def _ld_start_secretary_fleet():
+    for acc in _ld_fleet_accounts():
+        try:
+            db.set_secretary_enabled(acc["id"], True)
+            await start_secretary(acc)
+        except Exception:
+            pass
+
+
+async def _ld_stop_secretary_fleet():
+    for aid in db.list_linkdooni_account_ids():
+        acc = db.get_account(aid)
+        if not acc:
+            continue
+        try:
+            db.set_secretary_enabled(aid, False)
+            await stop_secretary(acc)
+        except Exception:
+            pass
+
+
+async def _linkdooni_engine_loop():
+    eng = linkdooni_engine
+    last_discover = 0.0
+    await _ld_start_secretary_fleet()
+    while not eng.get("stop"):
+        try:
+            nowm = time.monotonic()
+            if last_discover == 0.0 or (nowm - last_discover) >= config.LINKDOONI_DISCOVER_INTERVAL:
+                await _ld_discover_join()
+                last_discover = time.monotonic()
+            # keep local senders alive (self-heal dead tasks)
+            for acc in _ld_fleet_accounts():
+                await _ld_start_sender(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ موتور لینکدونی خطای دور (ادامه): {repr(e)[:140]}")
+        waited = 0
+        while waited < 60 and not eng.get("stop"):
+            await asyncio.sleep(2)
+            waited += 2
+
+
+async def start_linkdooni_engine():
+    if not _ld_fleet_accounts():
+        return False, "هیچ اکانتی برای لینکدونی انتخاب نشده."
+    if not db.list_linkdooni_channels():
+        return False, "هیچ کانال لینکدونی اضافه نشده."
+    if not db.list_linkdooni_texts():
+        return False, "هیچ متنی برای ارسال تنظیم نشده."
+    db.set_linkdooni_enabled(True)
+    old = linkdooni_engine.get("task")
+    if old and not old.done():
+        linkdooni_engine["stop"] = True
+        try:
+            await asyncio.wait_for(old, timeout=5)
+        except Exception:
+            pass
+    linkdooni_engine["stop"] = False
+    linkdooni_engine["task"] = asyncio.create_task(_linkdooni_engine_loop())
+    await log(card("📨 LINKDOONI ENGINE — روشن", [
+        f"👥 اکانت‌ها : {len(_ld_fleet_accounts())}",
+        f"📋 کانال‌ها : {len(db.list_linkdooni_channels())}",
+        f"✍️ متن‌ها : {len(db.list_linkdooni_texts())}",
+        f"🔢 سقف روزانه گروه : {db.get_linkdooni_config().get('daily_groups')}",
+        f"⏱ فاصله ارسال : {db.get_linkdooni_config().get('send_interval')}s",
+        f"🕒 {now()}"]))
+    return True, "ok"
+
+
+async def stop_linkdooni_engine():
+    db.set_linkdooni_enabled(False)
+    linkdooni_engine["stop"] = True
+    t = linkdooni_engine.get("task")
+    if t and not t.done():
+        try:
+            await asyncio.wait_for(t, timeout=5)
+        except Exception:
+            t.cancel()
+    for acc in _ld_fleet_accounts():
+        await _ld_stop_sender(acc)
+    await _ld_stop_secretary_fleet()
+    await log(card("📨 LINKDOONI ENGINE — خاموش", [f"🕒 {now()}"]))
+
+
+async def linkdooni_summary_loop():
+    """Every LINKDOONI_SUMMARY_INTERVAL, post the per-account stats card (sends +
+    secretary replies + joined groups) with a stop button — only while the
+    engine is enabled."""
+    while True:
+        await asyncio.sleep(config.LINKDOONI_SUMMARY_INTERVAL)
+        try:
+            cfg = db.get_linkdooni_config()
+            if not cfg.get("enabled"):
+                continue
+            fleet_ids = db.list_linkdooni_account_ids()
+            rows = []
+            tot_sent = tot_rep = tot_join = 0
+            for aid in fleet_ids:
+                acc = db.get_account(aid)
+                if not acc:
+                    continue
+                la = db.get_linkdooni_account(aid)
+                sent = int(la.get("sent_total", 0) or 0)
+                joined = int(la.get("joined_total", 0) or 0)
+                try:
+                    rep = int(db.get_secretary(aid).get("replied_total", 0) or 0)
+                except Exception:
+                    rep = 0
+                tot_sent += sent
+                tot_rep += rep
+                tot_join += joined
+                rows.append(f"📱 {acc['phone']} — ✉️ {sent} | 🤖 {rep} منشی | 👥 {joined}")
+            rows.append(LINE)
+            rows.append(f"📊 جمع کل — ✉️ {tot_sent} ارسال | 🤖 {tot_rep} منشی | 👥 {tot_join} گروه")
+            rows.append(f"🕒 {now()}")
+            await bot.send_message(config.LOG_GROUP_ID,
+                card("📨 LINKDOONI — گزارش دوره‌ای", rows),
+                buttons=[[Button.inline("⏹ توقف موتور لینکدونی", b"ld_stop")]])
+        except Exception as e:  # noqa: BLE001
+            print(f"[linkdooni_summary] {e}")
+
+
+async def recover_linkdooni():
+    """On boot, relaunch the linkdooni engine if it was enabled before restart."""
+    try:
+        if db.get_linkdooni_config().get("enabled"):
+            await start_linkdooni_engine()
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ بازگردانی موتور لینکدونی ناموفق: {repr(e)[:120]}")
+
+
+# --------------------------------------------------------------------------- #
+# Linkdooni panel UI
+# --------------------------------------------------------------------------- #
+def _linkdooni_menu_text():
+    cfg = db.get_linkdooni_config()
+    return card("📨 موتور لینکدونی", [
+        f"وضعیت : {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}",
+        f"📋 کانال‌های لینکدونی : {len(db.list_linkdooni_channels())}",
+        f"👥 اکانت‌های انتخابی : {len(db.list_linkdooni_account_ids())}",
+        f"✍️ متن‌ها : {len(db.list_linkdooni_texts())}",
+        f"🔢 سقف گروه روزانه (کل) : {cfg.get('daily_groups')}",
+        f"⏱ فاصله ارسال هر اکانت : {cfg.get('send_interval')}s",
+        LINE,
+        "ربات از کانال‌ها لینک گروه می‌گیره، روزانه گروه‌های جدید رو بین اکانت‌ها"
+        " پخش و join می‌کنه، متن‌ها رو می‌فرسته، و منشی هم همزمان روشنه.",
+    ])
+
+
+def _linkdooni_menu_buttons():
+    cfg = db.get_linkdooni_config()
+    rows = [
+        [Button.inline("➕ افزودن کانال لینکدونی", b"ld_addch"),
+         Button.inline("🗑 پاک‌کردن کانال‌ها", b"ld_clrch")],
+        [Button.inline("👥 انتخاب اکانت‌ها", b"ld_accs")],
+        [Button.inline("✍️ افزودن متن", b"ld_addtext"),
+         Button.inline("🗑 پاک‌کردن متن‌ها", b"ld_clrtext")],
+        [Button.inline("⏱ فاصله ارسال", b"ld_interval"),
+         Button.inline("🔢 سقف روزانه", b"ld_daily")],
+    ]
+    if cfg.get("enabled"):
+        rows.append([Button.inline("⏹ توقف موتور", b"ld_stop")])
+    else:
+        rows.append([Button.inline("▶️ شروع موتور", b"ld_start")])
+    rows.append([Button.inline("🔙 بازگشت", b"home")])
+    return rows
+
+
+@bot.on(events.CallbackQuery(data=b"linkdooni"))
+async def linkdooni_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, _linkdooni_menu_text(), buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_addch"))
+async def ld_addch_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_ld_channels"}
+    await safe_edit(event,
+        "📋 لینک/آیدی کانال‌های لینکدونی رو بفرست (هر خط یا با فاصله یکی).\n"
+        "مثال: `@mychannel` یا `https://rubika.ir/mychannel` یا guid کانال (c0...).",
+        buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+async def handle_ld_channels(event, st):
+    state.pop(event.sender_id, None)
+    raw = event.raw_text.strip()
+    refs = [p for p in _re_u.split(r"[\s,]+", raw) if p.strip()]
+    added = 0
+    for r in refs:
+        if db.add_linkdooni_channel(r):
+            added += 1
+    await event.respond(f"✅ {added} کانال لینکدونی اضافه شد "
+                        f"(کل: {len(db.list_linkdooni_channels())}).",
+                        buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_clrch"))
+async def ld_clrch_cb(event):
+    if not is_owner(event):
+        return
+    db.clear_linkdooni_channels()
+    await safe_edit(event, _linkdooni_menu_text(), buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_accs"))
+async def ld_accs_cb(event):
+    if not is_owner(event):
+        return
+    sel = set(db.list_linkdooni_account_ids())
+    rows = []
+    for a in db.list_accounts():
+        mark = "✅" if a["id"] in sel else "⬜️"
+        tag = "" if a["status"] == "active" else " ⚠️"
+        rows.append([Button.inline(f"{mark} {a['phone']}{tag}",
+                                   f"ldacc_{a['id']}".encode())])
+    rows.append([Button.inline("🔙 بازگشت", b"linkdooni")])
+    await safe_edit(event, "👥 اکانت‌های لینکدونی رو انتخاب کن:", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"ldacc_(\\d+)"))
+async def ld_acc_toggle_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    db.toggle_linkdooni_account(aid)
+    await ld_accs_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"ld_addtext"))
+async def ld_addtext_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_ld_text"}
+    await safe_edit(event, "✍️ متن ارسالی رو بفرست (هر بار یک متن؛ می‌تونی چند بار بزنی).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+async def handle_ld_text(event, st):
+    state.pop(event.sender_id, None)
+    txt = event.raw_text.strip()
+    if not txt:
+        await event.respond("متن خالیه.", buttons=_linkdooni_menu_buttons())
+        return
+    db.add_linkdooni_text(txt)
+    await event.respond(f"✅ متن اضافه شد (کل: {len(db.list_linkdooni_texts())}).",
+                        buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_clrtext"))
+async def ld_clrtext_cb(event):
+    if not is_owner(event):
+        return
+    db.clear_linkdooni_texts()
+    await safe_edit(event, _linkdooni_menu_text(), buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_interval"))
+async def ld_interval_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_ld_interval"}
+    await safe_edit(event,
+        f"⏱ فاصله ارسال هر اکانت (ثانیه) رو بفرست "
+        f"(بین {config.LINKDOONI_MIN_INTERVAL} تا {config.LINKDOONI_MAX_INTERVAL}):",
+        buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+async def handle_ld_interval(event, st):
+    state.pop(event.sender_id, None)
+    db.set_linkdooni_interval(event.raw_text.strip())
+    await event.respond(
+        f"✅ فاصله ارسال روی {db.get_linkdooni_config().get('send_interval')} ثانیه تنظیم شد.",
+        buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_daily"))
+async def ld_daily_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_ld_daily"}
+    await safe_edit(event, "🔢 سقف گروه‌های جدید روزانه (کل، نه per-account) رو بفرست:",
+                    buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+async def handle_ld_daily(event, st):
+    state.pop(event.sender_id, None)
+    db.set_linkdooni_daily_groups(event.raw_text.strip())
+    await event.respond(
+        f"✅ سقف روزانه روی {db.get_linkdooni_config().get('daily_groups')} گروه تنظیم شد.",
+        buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_start"))
+async def ld_start_cb(event):
+    if not is_owner(event):
+        return
+    ok, msg = await start_linkdooni_engine()
+    if not ok:
+        await event.answer(msg, alert=True)
+        return
+    await safe_edit(event,
+        "▶️ موتور لینکدونی روشن شد. کشف/join و ارسال در گروه لاگ گزارش می‌شه.\n"
+        "هر ۲۰ دقیقه کارت آماری با دکمه‌ی توقف میاد.",
+        buttons=[[Button.inline("⏹ توقف موتور", b"ld_stop")],
+                 [Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+@bot.on(events.CallbackQuery(data=b"ld_stop"))
+async def ld_stop_cb(event):
+    if not is_owner(event):
+        return
+    await event.answer("در حال خاموش‌کردن موتور لینکدونی ...")
+    await stop_linkdooni_engine()
+    await safe_edit(event, "⏹ موتور لینکدونی خاموش شد.",
+                    buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
 
 
 # --------------------------------------------------------------------------- #

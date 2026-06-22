@@ -1404,3 +1404,72 @@ async def add_contact(client: Client, phone: str, first_name: str = "",
         if u:
             guid = _guid_of(u)
     return {"on_rubika": bool(guid), "guid": guid}
+
+
+
+# =========================================================================== #
+# YoudonoaAx UPDATE — Item 3 helper: extract Rubika GROUP invite links from a
+# block of text (used by the linkdooni engine to harvest group links posted in
+# "linkdooni" channels). Only GROUP join links (joing) are returned — channel
+# links (joinc) are intentionally ignored. Additive: changes nothing above.
+# =========================================================================== #
+import re as _re_links
+
+_GROUP_LINK_RE = _re_links.compile(
+    r"https?://(?:rubika\.ir|rubika\.me|rubika\.app)/joing/[A-Za-z0-9_\-]+",
+    _re_links.IGNORECASE)
+
+
+def extract_group_links(text: str) -> list:
+    """Return a de-duplicated list of Rubika GROUP invite links found in `text`."""
+    if not text:
+        return []
+    out = []
+    seen = set()
+    for m in _GROUP_LINK_RE.findall(text):
+        link = m.rstrip("/")
+        if link not in seen:
+            seen.add(link)
+            out.append(link)
+    return out
+
+
+async def get_group_guid_by_link(client: Client, link: str):
+    """Resolve a GROUP invite link into its group guid WITHOUT joining, when the
+    rubpy build supports it. Returns the guid or None."""
+    link = (link or "").strip()
+    if not link:
+        return None
+    hash_part = link.rstrip("/").split("/")[-1]
+    for name in ("group_preview_by_join_link", "get_group_info_by_link",
+                 "group_preview", "get_join_link_info"):
+        fn = getattr(client, name, None)
+        if fn is None:
+            continue
+        try:
+            res = await _try_call(fn, [
+                lambda a=link: ((a,), {}),
+                lambda a=hash_part: ((a,), {}),
+                lambda a=link: ((), {"link": a}),
+                lambda a=hash_part: ((), {"hash": a}),
+            ])
+        except Exception:
+            continue
+        d = _data_of(res)
+        g = (d.get("group_guid") if isinstance(d, dict) else None) or _guid_of(res)
+        if g:
+            return g
+    return None
+
+
+def join_result_group_guid(res):
+    """Pull the group guid out of a join_group_by_link() result, if present."""
+    d = _data_of(res)
+    if isinstance(d, dict):
+        for key in ("group_guid", "object_guid"):
+            if d.get(key):
+                return d[key]
+        grp = d.get("group")
+        if isinstance(grp, dict):
+            return grp.get("group_guid") or grp.get("object_guid")
+    return _guid_of(res)
