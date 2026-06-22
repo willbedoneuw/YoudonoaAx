@@ -958,6 +958,8 @@ async def message_router(event):
         await handle_tg_comment_text(event)
     elif step == "await_tg_secretary_content":
         await handle_tg_secretary_content(event)
+    elif step == "await_tg_text2":
+        await handle_tg_text2(event)
 
 
 async def handle_delay(event):
@@ -4368,6 +4370,7 @@ async def tg_account_menu_cb(event):
         f"🎯 سنایپر : {'🟢' if snip_on else '⚪️'}",
         f"📦 محتوای ارسال : "
         + ("🖼 فایل" if cont.get("media") else ("✍️ متن" if cont.get("text") else "—"))
+        + ("  ➕متن۲" if cont.get("text2") else "")
         + f"    ⏱ {db.tg_get_send_delay()}s",
     ]
     rows = [
@@ -4378,7 +4381,8 @@ async def tg_account_menu_cb(event):
          Button.inline("📦 پاسخ منشی", b"tgsecset")],
         [Button.inline("⏹ سنایپر" if snip_on else "▶️ سنایپر", f"tgsniptog_{rid}".encode()),
          Button.inline("🔑 کلیدواژه", b"tgkwadd")],
-        [Button.inline("📦 محتوای ارسال", b"tgmcontent"),
+        [Button.inline("📦 محتوا۱", b"tgmcontent"),
+         Button.inline("✍️ متن۲", b"tgtext2"),
          Button.inline("⏱ سرعت", b"tgspeed")],
         [Button.inline("🗑 حذف اکانت", f"tgdel_{rid}".encode())],
         [Button.inline("🔙 پنل تلگرام", b"tg")],
@@ -4575,7 +4579,35 @@ async def handle_tg_mutual_content(event):
 
 
 # ----- speed (0.2 .. 1.0) -----
-@bot.on(events.CallbackQuery(data=b"tgspeed"))
+@bot.on(events.CallbackQuery(data=b"tgtext2"))
+async def tg_text2_cb(event):
+    if not is_owner(event):
+        return
+    cur = db.tg_get_mutual_content().get("text2", "")
+    state[event.sender_id] = {"step": "await_tg_text2"}
+    await safe_edit(event,
+        "✍️ متنِ دومِ ارسال رو بفرست (بعد از محتوای اول، این هم به همون مخاطب فرستاده می‌شه).\n"
+        f"الان: {('«'+cur[:60]+'»') if cur else '—'}\n"
+        "برای پاک‌کردنِ متنِ دوم، فقط یه نقطه (.) بفرست.",
+        buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
+
+
+async def handle_tg_text2(event):
+    state.pop(event.sender_id, None)
+    txt = (event.raw_text or "").strip()
+    if txt == ".":
+        db.tg_set_mutual_text2("")
+        await event.respond("🗑 متنِ دوم پاک شد.", buttons=_tg_menu_buttons())
+        return
+    if not txt:
+        await event.respond("متن خالیه.", buttons=_tg_menu_buttons())
+        return
+    db.tg_set_mutual_text2(txt)
+    await event.respond("✅ متنِ دوم ذخیره شد. (موقعِ ارسال بعد از محتوای اول فرستاده می‌شه.)",
+                        buttons=_tg_menu_buttons())
+
+
+
 async def tg_speed_cb(event):
     if not is_owner(event):
         return
@@ -4662,8 +4694,9 @@ async def _tg_mutual_progress_loop(phone, ctl, msg):
 async def _tg_run_mutual(owner_id, acc):
     phone = acc["phone"]
     content = db.tg_get_mutual_content()
-    if not content.get("text") and not content.get("media"):
-        await bot.send_message(owner_id, "اول «📦 محتوای دوطرفه» رو تنظیم کن.")
+    text2 = content.get("text2", "")
+    if not content.get("text") and not content.get("media") and not text2:
+        await bot.send_message(owner_id, "اول «📦 محتوای ارسال» یا «✍️ متن دوم» رو تنظیم کن.")
         return
     delay = db.tg_get_send_delay()
     await log(card("✈️ TG MUTUAL SEND START", [
@@ -4704,12 +4737,16 @@ async def _tg_run_mutual(owner_id, acc):
             ctl["done"] += 1
             continue
         try:
-            await tg.send_content(client, u, content.get("text", ""),
-                                  content.get("media", ""), content.get("caption", ""),
-                                  typing=_tg_typing_secs())
+            if content.get("text") or content.get("media"):
+                await tg.send_content(client, u, content.get("text", ""),
+                                      content.get("media", ""), content.get("caption", ""),
+                                      typing=_tg_typing_secs())
+                db.tg_incr_sent(phone, 1)
+            if text2:
+                await tg.send_text(client, u, text2, typing=_tg_typing_secs())
+                db.tg_incr_sent(phone, 1)
             ctl["ok"] += 1
             db.tg_mark_sent(uid)
-            db.tg_incr_sent(phone, 1)
         except Exception:
             ctl["fail"] += 1
         ctl["done"] += 1
