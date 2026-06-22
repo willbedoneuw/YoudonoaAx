@@ -4226,20 +4226,57 @@ def _tg_menu_text():
 
 def _tg_menu_buttons():
     return [
-        [Button.inline("➕ افزودن اکانت تلگرام", b"tgadd"),
-         Button.inline("👤 اکانت‌ها", b"tgaccs")],
-        [Button.inline("📤 ارسال به دوطرفه‌ها", b"tgmutual")],
-        [Button.inline("🔁 تبچی (گروه‌ها)", b"tgtabchi")],
-        [Button.inline("🔗 جوین گروه", b"tgjoin"),
-         Button.inline("💬 کامنت‌انجین", b"tgcomment")],
-        [Button.inline("🎯 لیدسنایپر", b"tgsniper"),
-         Button.inline("🤖 منشی", b"tgsecretary")],
-        [Button.inline("📝 متن تبچی", b"tgtext"),
-         Button.inline("📦 محتوای دوطرفه", b"tgmcontent")],
-        [Button.inline("⏱ سرعت ارسال", b"tgspeed"),
-         Button.inline("🕒 فاصلهٔ تبچی", b"tgint")],
-        [Button.inline("🔙 بازگشت", b"home")],
+        [Button.inline("👤 اکانت‌ها", b"tgaccmenu"),
+         Button.inline("📤 ارسال به مخاطبین", b"tgsendmenu")],
+        [Button.inline("🔁 موتورها (تبچی/جوین/کامنت/سنایپر/منشی)", b"tgengines")],
+        [Button.inline("🔙 بازگشت به پنلِ روبیکا", b"home")],
     ]
+
+
+@bot.on(events.CallbackQuery(data=b"tgaccmenu"))
+async def tg_accmenu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, card("👤 اکانت‌های تلگرام", [
+        f"تعداد : {len(db.tg_list_accounts())}"]),
+        buttons=[[Button.inline("➕ افزودن اکانت", b"tgadd")],
+                 [Button.inline("📋 لیستِ اکانت‌ها", b"tgaccs")],
+                 [Button.inline("🔙 پنل تلگرام", b"tg")]])
+
+
+@bot.on(events.CallbackQuery(data=b"tgsendmenu"))
+async def tg_sendmenu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    cont = db.tg_get_mutual_content()
+    await safe_edit(event, card("📤 ارسال به مخاطبین", [
+        "ترتیب: اول دوطرفه‌ها، بعد بقیهٔ مخاطبین.",
+        f"📦 محتوا : "
+        + ("🖼 فایل+کپشن" if cont.get("media") else ("✍️ متن" if cont.get("text") else "—")),
+        f"⏱ سرعت : {db.tg_get_send_delay()}s"]),
+        buttons=[[Button.inline("📦 تنظیم محتوا", b"tgmcontent"),
+                  Button.inline("⏱ سرعت", b"tgspeed")],
+                 [Button.inline("🚀 شروع ارسال", b"tgmutual")],
+                 [Button.inline("🔙 پنل تلگرام", b"tg")]])
+
+
+@bot.on(events.CallbackQuery(data=b"tgengines"))
+async def tg_engines_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, card("🔁 موتورهای تلگرام", [
+        "هر کدوم رو جدا روشن/خاموش کن. لاگ همه‌چی تو گپ لاگ میاد."]),
+        buttons=[[Button.inline("🔁 تبچی (گروه‌ها)", b"tgtabchi")],
+                 [Button.inline("🔗 جوین گروه", b"tgjoin"),
+                  Button.inline("💬 کامنت‌انجین", b"tgcomment")],
+                 [Button.inline("🎯 لیدسنایپر", b"tgsniper"),
+                  Button.inline("🤖 منشی", b"tgsecretary")],
+                 [Button.inline("📝 متنِ تبچی", b"tgtext"),
+                  Button.inline("🕒 فاصلهٔ تبچی", b"tgint")],
+                 [Button.inline("🔙 پنل تلگرام", b"tg")]])
 
 
 @bot.on(events.CallbackQuery(data=b"tg"))
@@ -4321,11 +4358,14 @@ async def _tg_complete_login(event, ctx):
         f"🏷 اسم : {info.get('name', '—')}",
         f"🔖 یوزرنیم : @{info.get('username')}" if info.get("username") else "🔖 یوزرنیم : —",
         f"👥 مخاطبین : {info.get('contacts', 0)}",
+        f"🤝 دوطرفه‌ها : {info.get('mutuals', 0)}",
+        f"👨‍👩‍👧 گروه‌ها : {info.get('groups', 0)}",
         f"🕒 {now()}",
     ]
     await log(card("✈️ TELEGRAM LOGIN ✅", rows))
     await event.respond(card("✈️ اکانتِ تلگرام اضافه شد ✅", rows),
-                        buttons=main_menu(is_real_owner(event)))
+                        buttons=[[Button.inline("📤 ارسال به مخاطبین", b"tgsendmenu")],
+                                 [Button.inline("🔙 پنل تلگرام", b"tg")]])
 
 
 # ----- account list / delete -----
@@ -4503,7 +4543,7 @@ def _tg_mutual_card(ctl) -> str:
     pct = int(done * 100 / total) if total else 0
     status = "⏸ مکث" if ctl.get("pause") else ("⏹ در حال توقف" if ctl.get("stop")
                                                 else "🟢 در حال ارسال")
-    return card("✈️ ارسال به دوطرفه‌ها — زنده", [
+    return card("✈️ ارسال به مخاطبین — زنده (اول دوطرفه‌ها)", [
         f"📱 {ctl.get('phone', '')}",
         f"وضعیت : {status}",
         f"📊 {done} از {total} — {pct}%",
@@ -4542,12 +4582,17 @@ async def _tg_run_mutual(owner_id, acc):
         await bot.send_message(owner_id, f"🔴 اکانت {phone} لاگین لازم داره ({repr(e)[:80]}).")
         return
     try:
-        mutuals = await tg.get_mutual_contacts(client)
+        targets, mutual_count = await tg.get_contacts_ordered(client)
     except Exception as e:  # noqa: BLE001
-        await bot.send_message(owner_id, f"❌ گرفتنِ مخاطبینِ دوطرفه ناموفق: {repr(e)[:120]}")
+        await bot.send_message(owner_id, f"❌ گرفتنِ مخاطبین ناموفق: {repr(e)[:120]}")
         return
+    await log(card("✈️ TG SEND — ترتیب", [
+        f"📱 {phone}", f"🤝 دوطرفه‌ها (اول) : {mutual_count}",
+        f"👥 بقیهٔ مخاطبین (بعد) : {len(targets) - mutual_count}",
+        f"📊 کل : {len(targets)}"]))
     ctl = {"stop": False, "pause": False, "ok": 0, "fail": 0, "skip": 0,
-           "total": len(mutuals), "done": 0, "phone": phone, "finished": False}
+           "total": len(targets), "done": 0, "phone": phone, "finished": False,
+           "mutuals": mutual_count}
     tg_jobs[phone] = ctl
     _, running = _tg_ctl_buttons(phone)
     try:
@@ -4555,7 +4600,7 @@ async def _tg_run_mutual(owner_id, acc):
     except Exception:
         msg = None
     prog = asyncio.create_task(_tg_mutual_progress_loop(phone, ctl, msg)) if msg else None
-    for u in mutuals:
+    for u in targets:
         if await _ctl_gate(ctl):
             break
         uid = getattr(u, "id", None)
@@ -4587,12 +4632,12 @@ async def _tg_run_mutual(owner_id, acc):
     if msg:
         try:
             await safe_edit(msg, _tg_mutual_card(ctl),
-                            buttons=[[Button.inline("🏠 منو", b"home")]])
+                            buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
         except Exception:
             pass
     await bot.send_message(owner_id,
-        f"✈️ ارسال به دوطرفه‌ها تموم شد. ✅ {ctl['ok']} / ❌ {ctl['fail']} — نرخ {pct}%",
-        buttons=main_menu(owner_id == config.OWNER_ID))
+        f"✈️ ارسال تموم شد. ✅ {ctl['ok']} / ❌ {ctl['fail']} — نرخ {pct}%",
+        buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
 
 
 @bot.on(events.CallbackQuery(data=b"tgmutual"))
@@ -4608,7 +4653,7 @@ async def tg_mutual_cb(event):
     rows.append([Button.inline("🔙 بازگشت", b"tg")])
     await safe_edit(event,
         "📤 ارسال به مخاطبینِ دوطرفه — یک اکانت انتخاب کن.\n"
-        "(فقط به کسایی که همدیگه رو اَد کردین می‌فرسته — امن‌ترین حالت.)", buttons=rows)
+        "(اول دوطرفه‌ها، بعد بقیهٔ مخاطبین. ضدتکرارِ سراسری فعاله.)", buttons=rows)
 
 
 @bot.on(events.CallbackQuery(pattern=b"tgmut_(\\d+)"))
@@ -4622,8 +4667,8 @@ async def tg_mutual_pick_cb(event):
     if acc["phone"] in tg_jobs:
         await event.answer("یه ارسال روی این اکانت همین الان در جریانه.", alert=True)
         return
-    await safe_edit(event, f"📤 ارسال به دوطرفه‌های {acc['phone']} شروع شد. گزارش تو گپ لاگ میاد.",
-                    buttons=[[Button.inline("🏠 منو", b"home")]])
+    await safe_edit(event, f"📤 ارسال به مخاطبینِ {acc['phone']} شروع شد (اول دوطرفه‌ها). گزارش تو گپ لاگ میاد.",
+                    buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
     asyncio.create_task(_tg_run_mutual(event.sender_id, acc))
 
 
