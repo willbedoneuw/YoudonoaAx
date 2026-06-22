@@ -4234,6 +4234,7 @@ async def tg_menu_cb(event):
             mark = "🟢" if _tg_acc_on(a["phone"]) else "⚪️"
         rows.append([Button.inline(f"{mark} {a['phone']} — {a['name']}",
                                    f"tgacc_{a['rid']}".encode())])
+    rows.append([Button.inline("🌐 مدیریت همگانی (تبچی/منشی/جوین)", b"tgfleet")])
     rows.append([Button.inline("➕ افزودن اکانت", b"tgadd")])
     rows.append([Button.inline("🔙 بازگشت به روبیکا", b"home")])
     head = card("✈️ پنل تلگرام", [
@@ -4244,6 +4245,33 @@ async def tg_menu_cb(event):
 
 
 # ----- login -----
+@bot.on(events.CallbackQuery(data=b"tgfleet"))
+async def tg_fleet_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    active = len([a for a in db.tg_list_accounts() if a["status"] == "active"])
+    await safe_edit(event, card("🌐 مدیریت همگانیِ تلگرام", [
+        f"👤 اکانت‌های فعال : {active}",
+        f"🔁 تبچیِ روشن : {len(tg_tabchi_tasks)}    🤖 منشی : {len(tg_secretary['handlers'])}"
+        f"    🎯 سنایپر : {len(tg_sniper['handlers'])}",
+        "تبچی رو روی چند اکانت با هم روشن کن، لینکِ گروه بده تا همه جوین شن، متن/منشی بذار.",
+    ]), buttons=[
+        [Button.inline("🔁 تبچیِ همگانی (انتخاب اکانت‌ها)", b"tgtabchi")],
+        [Button.inline("⏹ توقفِ همهٔ تبچی‌ها", b"tgtaballoff")],
+        [Button.inline("▶️ منشیِ همه", b"tgsecon"),
+         Button.inline("⏹ منشیِ همه", b"tgsecoff")],
+        [Button.inline("▶️ سنایپرِ همه", b"tgsnipon"),
+         Button.inline("⏹ سنایپرِ همه", b"tgsnipoff")],
+        [Button.inline("🔗 جوین گروه (لینک بده)", b"tgjoin"),
+         Button.inline("💬 کامنت‌انجین", b"tgcomment")],
+        [Button.inline("📝 متن تبچی", b"tgtext"),
+         Button.inline("🔑 کلیدواژه", b"tgkwadd"),
+         Button.inline("📦 پاسخ منشی", b"tgsecset")],
+        [Button.inline("🔙 پنل تلگرام", b"tg")],
+    ])
+
+
 @bot.on(events.CallbackQuery(data=b"tgadd"))
 async def tg_add_cb(event):
     if not is_owner(event):
@@ -4736,7 +4764,8 @@ async def _tg_run_mutual(owner_id, acc):
             saved_media = await tg.upload_to_saved(client, content["media"],
                                                    content.get("caption", ""))
             await log(card("✈️ TG SEND — فایل تو Saved آپلود شد", [
-                f"📱 {phone}", "بقیه فقط فوروارد می‌شه (سریع‌تر).", f"🕒 {now()}"]))
+                f"📱 {phone}", "بقیه بدونِ برچسبِ فوروارد و بدونِ آپلودِ دوباره کپی می‌شه.",
+                f"🕒 {now()}"]))
         except Exception as e:  # noqa: BLE001
             saved_media = None
             await log(card("✈️ TG SEND — آپلودِ فایل ناموفق", [
@@ -4751,7 +4780,8 @@ async def _tg_run_mutual(owner_id, acc):
             continue
         try:
             if saved_media is not None:
-                await tg.forward_to(client, u, saved_media)   # forward, no re-upload
+                await tg.send_saved_media(client, u, saved_media,
+                                          content.get("caption", ""))   # copy, no fwd tag
                 db.tg_incr_sent(phone, 1)
             elif content.get("text"):
                 await tg.send_text(client, u, content.get("text", ""),
@@ -4936,7 +4966,18 @@ async def _tg_run_tabchi(phone, st):
                             last_idx = idx
                             db.tg_incr_sent(phone, 1)
                         except Exception:
-                            pass
+                            # likely forced-membership / write-forbidden: try to
+                            # bypass (join the required sponsor channel) and retry.
+                            try:
+                                if await _tg_handle_forced(client, g):
+                                    await tg.send_text(client, g, txt, typing=0.0)
+                                    st["sent"] = st.get("sent", 0) + 1
+                                    last_idx = idx
+                                    db.tg_incr_sent(phone, 1)
+                                    await log(card("✈️ TG تبچی — عضویتِ اجباری دور زده شد", [
+                                        f"📱 {phone}", f"🕒 {now()}"]))
+                            except Exception:
+                                pass
                         await asyncio.sleep(max(0.0, float(delay)))
                 except Exception as e:  # noqa: BLE001
                     await tg.drop_client(phone)
