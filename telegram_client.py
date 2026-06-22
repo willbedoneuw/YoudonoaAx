@@ -279,6 +279,20 @@ async def forward_to(client: TelegramClient, entity, message):
     return await safe_call(lambda: client.forward_messages(entity, message))
 
 
+async def send_saved_media(client: TelegramClient, entity, saved_msg, caption: str = ""):
+    """Re-send the media of an already-uploaded Saved-Messages message WITHOUT a
+    'Forwarded from' header and WITHOUT re-uploading the file (reuses the file
+    reference). Falls back to a plain forward if the build can't reuse media."""
+    media = getattr(saved_msg, "media", None)
+    if media is not None:
+        try:
+            return await safe_call(
+                lambda: client.send_file(entity, media, caption=caption or None))
+        except Exception:
+            pass
+    return await safe_call(lambda: client.forward_messages(entity, saved_msg))
+
+
 # --------------------------------------------------------------------------- #
 # Group / channel join + comment / forced-membership helpers (phases 3-5).
 # --------------------------------------------------------------------------- #
