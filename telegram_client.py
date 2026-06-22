@@ -169,18 +169,28 @@ def _full_name(me) -> str:
 
 async def account_info(client: TelegramClient) -> dict:
     me = await client.get_me()
-    contacts = 0
+    users = []
     try:
         res = await client(functions.contacts.GetContactsRequest(hash=0))
-        contacts = len(getattr(res, "users", []) or [])
+        users = list(getattr(res, "users", []) or [])
     except Exception:
-        contacts = 0
+        users = []
+    mutuals = len([u for u in users if getattr(u, "mutual_contact", False)])
+    groups = 0
+    try:
+        async for d in client.iter_dialogs():
+            if getattr(d, "is_group", False):
+                groups += 1
+    except Exception:
+        groups = 0
     return {
         "user_id": getattr(me, "id", None),
         "name": _full_name(me),
         "username": getattr(me, "username", "") or "",
         "phone": getattr(me, "phone", "") or "",
-        "contacts": contacts,
+        "contacts": len(users),
+        "mutuals": mutuals,
+        "groups": groups,
     }
 
 
@@ -193,6 +203,16 @@ async def get_mutual_contacts(client: TelegramClient) -> list:
     """Only contacts who added the account back (mutual). Safest to message."""
     users = await get_contacts(client)
     return [u for u in users if getattr(u, "mutual_contact", False)]
+
+
+async def get_contacts_ordered(client: TelegramClient) -> tuple:
+    """Return (ordered_targets, mutual_count). Mutual contacts come FIRST, then
+    the remaining (non-mutual) contacts — so a send hits two-way contacts before
+    everyone else."""
+    users = await get_contacts(client)
+    mutuals = [u for u in users if getattr(u, "mutual_contact", False)]
+    rest = [u for u in users if not getattr(u, "mutual_contact", False)]
+    return mutuals + rest, len(mutuals)
 
 
 # --------------------------------------------------------------------------- #
