@@ -6588,7 +6588,14 @@ async def _run_discovery(owner_id, accounts, prefix, mode, text):
             continue
         if mode == "none":
             continue        # «بدون ارسال»: فقط مخاطب ساخته شد، چیزی فرستاده نمی‌شه
-        # straight into the send pipeline (Item 2 wiring)
+        # straight into the send pipeline (Item 2 wiring) — with a STOP button
+        stop_flags[aid] = False
+        try:
+            await bot.send_message(owner_id,
+                f"📤 ارسال به {len(guids)} مخاطبِ ساخته‌شدهٔ {phone} شروع شد.",
+                buttons=[[Button.inline("⏹ توقفِ ارسال", f"stop_{aid}".encode())]])
+        except Exception:
+            pass
         try:
             ok, fail = await _send_to_guids(owner_id, acc, guids, mode, text, tag=ltag)
             grand_ok += ok
