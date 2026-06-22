@@ -4234,14 +4234,11 @@ async def tg_menu_cb(event):
             mark = "🟢" if _tg_acc_on(a["phone"]) else "⚪️"
         rows.append([Button.inline(f"{mark} {a['phone']} — {a['name']}",
                                    f"tgacc_{a['rid']}".encode())])
-    rows.append([Button.inline("🔗 جوین گروه", b"tgjoin"),
-                 Button.inline("💬 کامنت‌انجین", b"tgcomment")])
     rows.append([Button.inline("➕ افزودن اکانت", b"tgadd")])
     rows.append([Button.inline("🔙 بازگشت به روبیکا", b"home")])
     head = card("✈️ پنل تلگرام", [
         f"👤 اکانت‌ها : {len(accs)}",
-        "یک اکانت انتخاب کن تا تبچی/منشی/سنایپر/ارسالش رو یک‌جا مدیریت کنی.",
-        "🔗 جوین و 💬 کامنت کلِ ناوگانن (دکمه‌های پایین).",
+        "یک اکانت انتخاب کن — همه‌چیزش (ارسال/تبچی/منشی/سنایپر/جوین/کامنت) تو یک صفحه‌ست.",
     ])
     await safe_edit(event, head, buttons=rows)
 
@@ -4368,24 +4365,26 @@ async def tg_account_menu_cb(event):
         f"🔁 تبچی : {'🟢' if tab_on else '⚪️'}    "
         f"🤖 منشی : {'🟢' if sec_on else '⚪️'}    "
         f"🎯 سنایپر : {'🟢' if snip_on else '⚪️'}",
-        f"📦 محتوای ارسال : "
+        f"📦 محتوا : "
         + ("🖼 فایل" if cont.get("media") else ("✍️ متن" if cont.get("text") else "—"))
         + ("  ➕متن۲" if cont.get("text2") else "")
-        + f"    ⏱ {db.tg_get_send_delay()}s",
+        + f"    ⏱ سرعت: {db.tg_get_send_delay()}s",
     ]
     rows = [
-        [Button.inline("📤 ارسال به مخاطبین (اول دوطرفه‌ها)", f"tgrun_{rid}".encode())],
+        [Button.inline("📤 ارسال به مخاطبین", f"tgrun_{rid}".encode())],
         [Button.inline("⏹ تبچی" if tab_on else "▶️ تبچی", f"tgtabtog_{rid}".encode()),
-         Button.inline("📝 متن", b"tgtext"), Button.inline("🕒 فاصله", b"tgint")],
-        [Button.inline("⏹ منشی" if sec_on else "▶️ منشی", f"tgsectog_{rid}".encode()),
+         Button.inline("⏹ منشی" if sec_on else "▶️ منشی", f"tgsectog_{rid}".encode()),
+         Button.inline("⏹ سنایپر" if snip_on else "▶️ سنایپر", f"tgsniptog_{rid}".encode())],
+        [Button.inline("📝 متن تبچی", b"tgtext"),
+         Button.inline("🕒 فاصله تبچی", b"tgint")],
+        [Button.inline("🔑 کلیدواژه سنایپر", b"tgkwadd"),
          Button.inline("📦 پاسخ منشی", b"tgsecset")],
-        [Button.inline("⏹ سنایپر" if snip_on else "▶️ سنایپر", f"tgsniptog_{rid}".encode()),
-         Button.inline("🔑 کلیدواژه", b"tgkwadd")],
         [Button.inline("📦 محتوا۱", b"tgmcontent"),
-         Button.inline("✍️ متن۲", b"tgtext2"),
-         Button.inline("⏱ سرعت", b"tgspeed")],
-        [Button.inline("🗑 حذف اکانت", f"tgdel_{rid}".encode())],
-        [Button.inline("🔙 پنل تلگرام", b"tg")],
+         Button.inline("✍️ متن۲", b"tgtext2")],
+        [Button.inline("🔗 جوین گروه", b"tgjoin"),
+         Button.inline("💬 کامنت‌انجین", b"tgcomment")],
+        [Button.inline("🗑 حذف اکانت", f"tgdel_{rid}".encode()),
+         Button.inline("🔙 پنل تلگرام", b"tg")],
     ]
     await safe_edit(event, "\n".join(lines), buttons=rows)
 
