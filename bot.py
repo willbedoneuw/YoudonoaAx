@@ -109,6 +109,11 @@ tg_pending: dict = {}              # owner_id -> login ctx (code/password phase)
 tg_jobs: dict = {}                 # phone -> live mutual-send control dict
 tg_tabchi_tasks: dict = {}         # phone -> {"task":Task, "state":dict}
 tg_stats: dict = {}                # live tabchi pinned-stats card state
+tg_pv_counts: dict = {}            # phone -> incoming-PV count (secretary)
+tg_sniper: dict = {"on": False, "handlers": {}}      # lead sniper handlers per phone
+tg_secretary: dict = {"on": False, "handlers": {}, "seen": {}}  # PV auto-reply
+tg_join_engine: dict = {"task": None, "stop": False}
+tg_comment_engine: dict = {"task": None, "stop": False}
 
 
 def _alert_word(n: int) -> str:
@@ -945,6 +950,14 @@ async def message_router(event):
         await handle_tg_speed(event)
     elif step == "await_tg_interval":
         await handle_tg_interval(event)
+    elif step == "await_tg_link_channels":
+        await handle_tg_link_channels(event)
+    elif step == "await_tg_keyword":
+        await handle_tg_keyword(event)
+    elif step == "await_tg_comment_text":
+        await handle_tg_comment_text(event)
+    elif step == "await_tg_secretary_content":
+        await handle_tg_secretary_content(event)
 
 
 async def handle_delay(event):
@@ -4217,6 +4230,10 @@ def _tg_menu_buttons():
          Button.inline("👤 اکانت‌ها", b"tgaccs")],
         [Button.inline("📤 ارسال به دوطرفه‌ها", b"tgmutual")],
         [Button.inline("🔁 تبچی (گروه‌ها)", b"tgtabchi")],
+        [Button.inline("🔗 جوین گروه", b"tgjoin"),
+         Button.inline("💬 کامنت‌انجین", b"tgcomment")],
+        [Button.inline("🎯 لیدسنایپر", b"tgsniper"),
+         Button.inline("🤖 منشی", b"tgsecretary")],
         [Button.inline("📝 متن تبچی", b"tgtext"),
          Button.inline("📦 محتوای دوطرفه", b"tgmcontent")],
         [Button.inline("⏱ سرعت ارسال", b"tgspeed"),
@@ -4659,7 +4676,7 @@ def _tg_stats_card() -> str:
         sent = st.get("sent", 0)
         groups = st.get("groups", 0)
         rep = int(acc.get("replied_total", 0) or 0) if acc else 0
-        pv = st.get("pv", 0)
+        pv = tg_pv_counts.get(phone, 0)
         tot_sent += sent
         tot_rep += rep
         tot_groups += groups
@@ -4815,6 +4832,561 @@ async def tg_tabchi_alloff_cb(event):
         await _tg_stop_tabchi(phone)
     await event.answer("⏹ همهٔ تبچی‌ها خاموش شدن.")
     await tg_tabchi_cb(event)
+
+
+# =========================================================================== #
+# ✈️ TELEGRAM phases 3-6: join engine, comment engine, lead sniper, secretary.
+# =========================================================================== #
+def _tg_active_accounts() -> list:
+    return [a for a in db.tg_list_accounts() if a.get("status") == "active"]
+
+
+async def _tg_harvest_links(reader, channels) -> list:
+    phone = reader["phone"]
+    client = await tg.get_client(phone)
+    links, seen = [], set()
+    for ch in channels:
+        try:
+            ent = await client.get_entity(ch["ref"])
+        except Exception:
+            continue
+        for m in await tg.get_recent_messages(client, ent, config.TG_CHANNEL_SCAN):
+            for lk in tg.extract_tg_links(getattr(m, "message", "") or ""):
+                if lk not in seen:
+                    seen.add(lk)
+                    links.append(lk)
+    return links
+
+
+async def _tg_handle_forced(client, entity) -> bool:
+    """Heuristic 'must join @X to write': scan recent messages for t.me links
+    and join them, so the account can post afterwards."""
+    joined = False
+    try:
+        for m in await tg.get_recent_messages(client, entity, 15):
+            for lk in tg.extract_tg_links(getattr(m, "message", "") or ""):
+                try:
+                    await tg.join_link(client, lk)
+                    joined = True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return joined
+
+
+async def _tg_join_one(acc, link):
+    phone = acc["phone"]
+    try:
+        client = await tg.get_client(phone)
+        ent = await tg.join_link(client, link)
+        gid = getattr(ent, "id", None)
+        title = getattr(ent, "title", "") or ""
+        if gid:
+            db.tg_add_group(gid, link, phone, title)
+        try:
+            await tg.ensure_can_write(client, ent)      # forced-membership (API)
+        except Exception:
+            await _tg_handle_forced(client, ent)         # forced-membership (bot)
+        await log(card("✈️ TG JOIN ✅", [f"📱 {phone}", f"👥 {title or gid}",
+                                         f"🔗 {link}", f"🕒 {now()}"]))
+    except Exception as e:  # noqa: BLE001
+        await log(card("✈️ TG JOIN ❌", [f"📱 {phone}", f"🔗 {link}",
+                                         f"💥 {repr(e)[:120]}", f"🕒 {now()}"]))
+
+
+async def _tg_join_engine_loop():
+    eng = tg_join_engine
+    while not eng["stop"]:
+        accounts = _tg_active_accounts()
+        channels = db.tg_list_link_channels()
+        if not accounts or not channels:
+            await log(card("✈️ TG JOIN — متوقف", ["اکانت یا کانالِ منبع نیست."]))
+            break
+        try:
+            links = await _tg_harvest_links(accounts[0], channels)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ TG harvest خطا: {repr(e)[:120]}")
+            links = []
+        new = [lk for lk in links if db.tg_seen_link(lk)]   # marks + keeps NEW
+        if not new:
+            await log(card("✈️ TG JOIN — لینکِ جدیدی نیست", [
+                f"⏳ {config.TG_COMMENT_INTERVAL}s بعد دوباره چک می‌کنم.", f"🕒 {now()}"]))
+            waited = 0
+            while waited < config.TG_COMMENT_INTERVAL and not eng["stop"]:
+                await asyncio.sleep(2)
+                waited += 2
+            continue
+        await log(card("✈️ TG JOIN — دورِ جدید", [
+            f"🔗 لینکِ جدید : {len(new)}", f"👥 اکانت‌ها : {len(accounts)}",
+            f"📦 هر دسته : {config.TG_JOIN_BATCH}", f"🕒 {now()}"]))
+        for i in range(0, len(new), config.TG_JOIN_BATCH):
+            if eng["stop"]:
+                break
+            batch = new[i:i + config.TG_JOIN_BATCH]
+            # round-robin across accounts, concurrently
+            tasks = [_tg_join_one(accounts[j % len(accounts)], lk)
+                     for j, lk in enumerate(batch)]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(config.TG_JOIN_DELAY)
+    eng["task"] = None
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoin"))
+async def tg_join_cb(event):
+    if not is_owner(event):
+        return
+    running = tg_join_engine.get("task") is not None and not tg_join_engine["stop"]
+    chans = db.tg_list_link_channels()
+    rows = [[Button.inline("➕ افزودن کانالِ منبع (لینکدونی/تبچی)", b"tgjoinadd")],
+            [Button.inline(f"🗑 پاک‌کردن منابع ({len(chans)})", b"tgjoinclr")]]
+    if running:
+        rows.append([Button.inline("⏹ توقفِ موتورِ جوین", b"tgjoinstop")])
+    else:
+        rows.append([Button.inline("▶️ شروعِ موتورِ جوین", b"tgjoinstart")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, card("🔗 موتورِ جوینِ گروهِ تلگرام", [
+        f"📋 کانال‌های منبع : {len(chans)}",
+        f"وضعیت : {'🟢 روشن' if running else '🔴 خاموش'}",
+        f"📦 هر بار {config.TG_JOIN_BATCH} گروهِ جدید، چنداکانتِ همزمان، ضدتکرار.",
+        "عضویتِ اجباری هم خودکار هندل می‌شه."]), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoinadd"))
+async def tg_joinadd_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_link_channels"}
+    await safe_edit(event, "📋 لینک/آیدیِ کانال‌های منبع رو بفرست (هر خط یا با فاصله).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"tgjoin")]])
+
+
+async def handle_tg_link_channels(event):
+    state.pop(event.sender_id, None)
+    refs = [p for p in _re_u.split(r"[\s,]+", event.raw_text.strip()) if p.strip()]
+    added = sum(1 for r in refs if db.tg_add_link_channel(r))
+    await event.respond(f"✅ {added} کانالِ منبع اضافه شد "
+                        f"(کل: {len(db.tg_list_link_channels())}).",
+                        buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoinclr"))
+async def tg_joinclr_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_clear_link_channels()
+    await tg_join_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoinstart"))
+async def tg_joinstart_cb(event):
+    if not is_owner(event):
+        return
+    if not _tg_active_accounts():
+        await event.answer("اکانتِ فعالِ تلگرام نداری.", alert=True)
+        return
+    if not db.tg_list_link_channels():
+        await event.answer("اول کانالِ منبع اضافه کن.", alert=True)
+        return
+    tg_join_engine["stop"] = False
+    tg_join_engine["task"] = asyncio.create_task(_tg_join_engine_loop())
+    await event.answer("▶️ موتورِ جوین روشن شد.")
+    await tg_join_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoinstop"))
+async def tg_joinstop_cb(event):
+    if not is_owner(event):
+        return
+    tg_join_engine["stop"] = True
+    await event.answer("⏹ موتورِ جوین خاموش شد.")
+    await tg_join_cb(event)
+
+
+# --------------------------------------------------------------------------- #
+# Comment engine
+# --------------------------------------------------------------------------- #
+async def _tg_comment_engine_loop():
+    eng = tg_comment_engine
+    idx = 0
+    while not eng["stop"]:
+        accounts = _tg_active_accounts()
+        channels = db.tg_list_link_channels()
+        texts = db.tg_list_comment_texts()
+        if not accounts or not channels or not texts:
+            await log(card("✈️ TG COMMENT — متوقف", ["اکانت/کانال/متنِ کامنت ناقصه."]))
+            break
+        last = None
+        for ch in channels:
+            if eng["stop"]:
+                break
+            acc = accounts[idx % len(accounts)]
+            idx += 1
+            try:
+                client = await tg.get_client(acc["phone"])
+                ent = await client.get_entity(ch["ref"])
+                disc = await tg.get_linked_discussion(client, ent)
+                if disc is None:
+                    continue        # channel has comments disabled
+                post_ids = await tg.get_recent_post_ids(client, ent, config.TG_COMMENT_SCAN)
+                for pid in post_ids:
+                    if eng["stop"]:
+                        break
+                    i, txt = _pick_text(texts, last)
+                    last = i
+                    try:
+                        await tg.comment_to_post(client, ent, pid, txt,
+                                                 typing=_tg_typing_secs())
+                        db.tg_incr_sent(acc["phone"], 1)
+                        await log(card("✈️ TG COMMENT ✅", [
+                            f"📱 {acc['phone']}", f"📢 {ch['ref']}", f"📝 post {pid}",
+                            f"🕒 {now()}"]))
+                    except Exception as e:  # noqa: BLE001
+                        await log(card("✈️ TG COMMENT ❌", [
+                            f"📱 {acc['phone']}", f"📢 {ch['ref']}",
+                            f"💥 {repr(e)[:110]}"]))
+                    await asyncio.sleep(db.tg_get_send_delay())
+            except Exception as e:  # noqa: BLE001
+                await log(f"⚠️ کامنت‌انجین خطا ({ch['ref']}): {repr(e)[:110]}")
+        waited = 0
+        while waited < config.TG_COMMENT_INTERVAL and not eng["stop"]:
+            await asyncio.sleep(2)
+            waited += 2
+    eng["task"] = None
+
+
+@bot.on(events.CallbackQuery(data=b"tgcomment"))
+async def tg_comment_cb(event):
+    if not is_owner(event):
+        return
+    running = tg_comment_engine.get("task") is not None and not tg_comment_engine["stop"]
+    rows = [[Button.inline("✍️ افزودن متنِ کامنت", b"tgcadd"),
+             Button.inline("🗑 پاک‌کردن", b"tgcclr")]]
+    if running:
+        rows.append([Button.inline("⏹ توقفِ کامنت‌انجین", b"tgcstop")])
+    else:
+        rows.append([Button.inline("▶️ شروعِ کامنت‌انجین", b"tgcstart")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, card("💬 کامنت‌انجین تلگرام", [
+        f"📝 متن‌های کامنت : {len(db.tg_list_comment_texts())}",
+        f"📋 کانال‌های منبع : {len(db.tg_list_link_channels())} (مشترک با موتورِ جوین)",
+        f"وضعیت : {'🟢 روشن' if running else '🔴 خاموش'}",
+        "کانال‌های کامنت‌دار رو خودش با linked_chat تشخیص می‌ده و زیرِ پست‌ها کامنت می‌ذاره."]),
+        buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"tgcadd"))
+async def tg_cadd_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_comment_text"}
+    await safe_edit(event, "✍️ متنِ کامنت رو بفرست (هر بار یکی).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"tgcomment")]])
+
+
+async def handle_tg_comment_text(event):
+    state.pop(event.sender_id, None)
+    txt = event.raw_text.strip()
+    if not txt:
+        await event.respond("متن خالیه.", buttons=_tg_menu_buttons())
+        return
+    db.tg_add_comment_text(txt)
+    await event.respond(f"✅ اضافه شد (کل: {len(db.tg_list_comment_texts())}).",
+                        buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgcclr"))
+async def tg_cclr_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_clear_comment_texts()
+    await tg_comment_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgcstart"))
+async def tg_cstart_cb(event):
+    if not is_owner(event):
+        return
+    if not db.tg_list_comment_texts() or not db.tg_list_link_channels():
+        await event.answer("اول متنِ کامنت و کانالِ منبع تنظیم کن.", alert=True)
+        return
+    tg_comment_engine["stop"] = False
+    tg_comment_engine["task"] = asyncio.create_task(_tg_comment_engine_loop())
+    await event.answer("▶️ کامنت‌انجین روشن شد.")
+    await tg_comment_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgcstop"))
+async def tg_cstop_cb(event):
+    if not is_owner(event):
+        return
+    tg_comment_engine["stop"] = True
+    await event.answer("⏹ کامنت‌انجین خاموش شد.")
+    await tg_comment_cb(event)
+
+
+# --------------------------------------------------------------------------- #
+# Lead Sniper — keyword monitor across the groups the accounts are in.
+# --------------------------------------------------------------------------- #
+def _make_sniper_handler(phone: str):
+    async def _handler(event):
+        try:
+            if not event.is_group:
+                return
+            text = event.raw_text or ""
+            if not text:
+                return
+            low = text.lower()
+            hit = next((k for k in db.tg_list_keywords() if k.lower() in low), None)
+            if not hit:
+                return
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                sender = None
+            uid = getattr(sender, "id", None) or event.sender_id
+            uname = getattr(sender, "username", "") or "—"
+            try:
+                chat = await event.get_chat()
+                title = getattr(chat, "title", "") or ""
+            except Exception:
+                title = ""
+            await log(card("🎯 LEAD SNIPER", [
+                f"🔑 کلیدواژه : {hit}",
+                f"🆔 {uid}   👤 @{uname}",
+                f"📍 گروه : {title}",
+                f"💬 {text[:600]}",
+                f"📱 اکانت : {phone}",
+                f"🕒 {now()}"]))
+        except Exception:
+            pass
+    return _handler
+
+
+async def _tg_start_sniper():
+    for acc in _tg_active_accounts():
+        phone = acc["phone"]
+        if phone in tg_sniper["handlers"]:
+            continue
+        try:
+            client = await tg.get_client(phone)
+            h = _make_sniper_handler(phone)
+            client.add_event_handler(h, events.NewMessage(incoming=True))
+            tg_sniper["handlers"][phone] = (client, h)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ لیدسنایپر {phone} وصل نشد: {repr(e)[:100]}")
+    tg_sniper["on"] = True
+
+
+async def _tg_stop_sniper():
+    for phone, (client, h) in list(tg_sniper["handlers"].items()):
+        try:
+            client.remove_event_handler(h)
+        except Exception:
+            pass
+    tg_sniper["handlers"].clear()
+    tg_sniper["on"] = False
+
+
+@bot.on(events.CallbackQuery(data=b"tgsniper"))
+async def tg_sniper_cb(event):
+    if not is_owner(event):
+        return
+    rows = [[Button.inline("➕ افزودن کلیدواژه", b"tgkwadd"),
+             Button.inline("🗑 پاک‌کردن", b"tgkwclr")]]
+    if tg_sniper["on"]:
+        rows.append([Button.inline("⏹ خاموش‌کردنِ لیدسنایپر", b"tgsnipoff")])
+    else:
+        rows.append([Button.inline("▶️ روشن‌کردنِ لیدسنایپر", b"tgsnipon")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, card("🎯 لیدسنایپر تلگرام", [
+        f"🔑 کلیدواژه‌ها : {', '.join(db.tg_list_keywords()) or '—'}",
+        f"وضعیت : {'🟢 روشن' if tg_sniper['on'] else '🔴 خاموش'}",
+        "هر پیامِ گروه که شاملِ کلیدواژه باشه، آیدی+یوزرنیم+متنِ کامل به گپ لاگ میاد."]),
+        buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"tgkwadd"))
+async def tg_kwadd_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_keyword"}
+    await safe_edit(event, "🔑 کلیدواژه‌ها رو بفرست (هر خط یا با فاصله/کاما).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"tgsniper")]])
+
+
+async def handle_tg_keyword(event):
+    state.pop(event.sender_id, None)
+    words = [w for w in _re_u.split(r"[\s,]+", event.raw_text.strip()) if w.strip()]
+    for w in words:
+        db.tg_add_keyword(w)
+    await event.respond(f"✅ کلیدواژه‌ها ذخیره شد: {', '.join(db.tg_list_keywords())}",
+                        buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgkwclr"))
+async def tg_kwclr_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_clear_keywords()
+    await tg_sniper_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgsnipon"))
+async def tg_snipon_cb(event):
+    if not is_owner(event):
+        return
+    if not db.tg_list_keywords():
+        await event.answer("اول کلیدواژه اضافه کن.", alert=True)
+        return
+    await _tg_start_sniper()
+    await log(card("🎯 LEAD SNIPER — روشن", [
+        f"🔑 {', '.join(db.tg_list_keywords())}", f"👥 اکانت‌ها : {len(tg_sniper['handlers'])}",
+        f"🕒 {now()}"]))
+    await event.answer("▶️ لیدسنایپر روشن شد.")
+    await tg_sniper_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgsnipoff"))
+async def tg_snipoff_cb(event):
+    if not is_owner(event):
+        return
+    await _tg_stop_sniper()
+    await log(card("🎯 LEAD SNIPER — خاموش", [f"🕒 {now()}"]))
+    await event.answer("⏹ خاموش شد.")
+    await tg_sniper_cb(event)
+
+
+# --------------------------------------------------------------------------- #
+# Secretary — auto-reply to incoming PVs (text or media+caption).
+# --------------------------------------------------------------------------- #
+def _make_secretary_handler(phone: str):
+    async def _handler(event):
+        try:
+            if not event.is_private:
+                return
+            try:
+                sender = await event.get_sender()
+                if getattr(sender, "bot", False):
+                    return
+            except Exception:
+                sender = None
+            uid = getattr(sender, "id", None) or event.sender_id
+            tg_pv_counts[phone] = tg_pv_counts.get(phone, 0) + 1
+            seen = tg_secretary["seen"].setdefault(phone, set())
+            if uid in seen:
+                return                       # reply ONCE per user
+            content = db.tg_get_secretary_content()
+            if not content.get("text") and not content.get("media"):
+                return
+            await tg.send_content(event.client, event.chat_id, content.get("text", ""),
+                                  content.get("media", ""), content.get("caption", ""),
+                                  typing=_tg_typing_secs())
+            seen.add(uid)
+            db.tg_incr_replied(phone, 1)
+            await log(card("🤖 منشی تلگرام — جواب داد", [
+                f"📱 {phone}", f"🆔 {uid}", f"🕒 {now()}"]))
+        except Exception:
+            pass
+    return _handler
+
+
+async def _tg_start_secretary():
+    for acc in _tg_active_accounts():
+        phone = acc["phone"]
+        if phone in tg_secretary["handlers"]:
+            continue
+        try:
+            client = await tg.get_client(phone)
+            h = _make_secretary_handler(phone)
+            client.add_event_handler(h, events.NewMessage(incoming=True))
+            tg_secretary["handlers"][phone] = (client, h)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ منشی {phone} وصل نشد: {repr(e)[:100]}")
+    tg_secretary["on"] = True
+
+
+async def _tg_stop_secretary():
+    for phone, (client, h) in list(tg_secretary["handlers"].items()):
+        try:
+            client.remove_event_handler(h)
+        except Exception:
+            pass
+    tg_secretary["handlers"].clear()
+    tg_secretary["on"] = False
+
+
+@bot.on(events.CallbackQuery(data=b"tgsecretary"))
+async def tg_secretary_cb(event):
+    if not is_owner(event):
+        return
+    cont = db.tg_get_secretary_content()
+    rows = [[Button.inline("📦 تنظیمِ پاسخِ منشی", b"tgsecset")]]
+    if tg_secretary["on"]:
+        rows.append([Button.inline("⏹ خاموش‌کردنِ منشی", b"tgsecoff")])
+    else:
+        rows.append([Button.inline("▶️ روشن‌کردنِ منشی", b"tgsecon")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, card("🤖 منشیِ تلگرام", [
+        f"📦 پاسخ : "
+        + ("🖼 فایل+کپشن" if cont.get("media") else ("✍️ متن" if cont.get("text") else "—")),
+        f"وضعیت : {'🟢 روشن' if tg_secretary['on'] else '🔴 خاموش'}",
+        "به هرکی تو پیوی پیام بده، یک‌بار پاسخِ تنظیم‌شده می‌فرسته."]), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"tgsecset"))
+async def tg_secset_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_secretary_content"}
+    await safe_edit(event, "📦 پاسخِ منشی رو بفرست (متن، یا عکس/ویس/فایل با کپشن).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"tgsecretary")]])
+
+
+async def handle_tg_secretary_content(event):
+    state.pop(event.sender_id, None)
+    caption = (event.raw_text or "").strip()
+    if event.media:
+        os.makedirs(TG_MEDIA_DIR, exist_ok=True)
+        try:
+            path = await event.download_media(
+                file=os.path.join(TG_MEDIA_DIR, f"sec_{int(time.time())}"))
+        except Exception as e:  # noqa: BLE001
+            await event.respond(f"❌ دانلود ناموفق: {repr(e)[:110]}")
+            return
+        db.tg_set_secretary_content(text="", media=path, caption=caption)
+        await event.respond("✅ پاسخِ منشی (فایل+کپشن) ذخیره شد.", buttons=_tg_menu_buttons())
+    else:
+        if not caption:
+            await event.respond("چیزی نفرستادی.")
+            return
+        db.tg_set_secretary_content(text=caption, media="", caption="")
+        await event.respond("✅ پاسخِ منشی (متن) ذخیره شد.", buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgsecon"))
+async def tg_secon_cb(event):
+    if not is_owner(event):
+        return
+    cont = db.tg_get_secretary_content()
+    if not cont.get("text") and not cont.get("media"):
+        await event.answer("اول پاسخِ منشی رو تنظیم کن.", alert=True)
+        return
+    await _tg_start_secretary()
+    await log(card("🤖 منشی تلگرام — روشن", [
+        f"👥 اکانت‌ها : {len(tg_secretary['handlers'])}", f"🕒 {now()}"]))
+    await event.answer("▶️ منشی روشن شد.")
+    await tg_secretary_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgsecoff"))
+async def tg_secoff_cb(event):
+    if not is_owner(event):
+        return
+    await _tg_stop_secretary()
+    await log(card("🤖 منشی تلگرام — خاموش", [f"🕒 {now()}"]))
+    await event.answer("⏹ خاموش شد.")
+    await tg_secretary_cb(event)
 
 
 # --------------------------------------------------------------------------- #

@@ -318,3 +318,58 @@ async def ensure_can_write(client: TelegramClient, entity) -> bool:
     except Exception:
         # not a channel (basic group) or already a member — assume writable
         return True
+
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3/4 helpers: read a channel's recent messages + comment under a post.
+# --------------------------------------------------------------------------- #
+async def get_recent_messages(client: TelegramClient, entity, limit: int = 100) -> list:
+    out = []
+    try:
+        async for m in client.iter_messages(entity, limit=limit):
+            out.append(m)
+    except Exception:
+        pass
+    return out
+
+
+async def get_recent_post_ids(client: TelegramClient, channel, limit: int = 5) -> list:
+    """IDs of the most recent posts of a channel (newest first)."""
+    ids = []
+    try:
+        async for m in client.iter_messages(channel, limit=limit):
+            if getattr(m, "id", None):
+                ids.append(m.id)
+    except Exception:
+        pass
+    return ids
+
+
+async def comment_to_post(client: TelegramClient, channel, post_id: int, text: str,
+                          typing: float = 0.0):
+    """Post a comment under a channel post (Telethon routes it to the linked
+    discussion group via comment_to). If the account must first join the
+    discussion group, join it and retry once."""
+    async def _send():
+        return await client.send_message(channel, text, comment_to=post_id)
+    if typing > 0:
+        try:
+            await asyncio.sleep(typing)
+        except Exception:
+            pass
+    try:
+        return await safe_call(_send)
+    except Exception:
+        # forced membership: join the linked discussion group, then retry once.
+        disc = await get_linked_discussion(client, channel)
+        if disc is not None:
+            try:
+                await client(functions.channels.JoinChannelRequest(disc))
+            except Exception:
+                pass
+        return await safe_call(_send)
+
+
+async def entity_id(entity) -> int:
+    return getattr(entity, "id", None)
