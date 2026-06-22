@@ -4258,7 +4258,7 @@ async def _offer_resume_after_send(owner_id: int, info: dict):
     if remaining:
         body.append(f"⏳ باقی‌مونده در لیست : {len(remaining)}")
     if is_remote:
-        body.append("📡 این اکانت روی ورکر بود؛ بعد از چک، ارسال ادامه/تکرار می‌شه.")
+        body.append("📡 این اکانت روی ورکر بود؛ با لاگین به ورکر جدید، ارسال ادامه/تکرار می‌شه.")
     if dead:
         body.append("🔴 وضعیت: احتمال باطل‌شدن/بلاک سشن")
     if remaining or is_remote:
