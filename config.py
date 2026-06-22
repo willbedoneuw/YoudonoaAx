@@ -416,3 +416,12 @@ def clamp_tg_interval(value) -> int:
     except (TypeError, ValueError):
         return TG_TABCHI_INTERVAL
     return max(TG_TABCHI_MIN_INTERVAL, min(TG_TABCHI_MAX_INTERVAL, v))
+
+
+
+# ---- Telegram engines: join / comment / sniper (phases 3-6) ----
+TG_JOIN_BATCH = _int("TG_JOIN_BATCH", 10)          # join N groups, then find N more
+TG_JOIN_DELAY = _float("TG_JOIN_DELAY", 3.0)        # pause between joins (per account)
+TG_CHANNEL_SCAN = _int("TG_CHANNEL_SCAN", 100)      # messages scanned per source channel
+TG_COMMENT_INTERVAL = _int("TG_COMMENT_INTERVAL", 1800)   # comment-engine pass interval
+TG_COMMENT_SCAN = _int("TG_COMMENT_SCAN", 5)        # recent posts to comment under per pass

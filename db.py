@@ -320,6 +320,42 @@ def init():
         )
         """
     )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_link_channels (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            ref      TEXT UNIQUE,
+            added_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_groups (
+            gid           INTEGER PRIMARY KEY,
+            link          TEXT,
+            title         TEXT DEFAULT '',
+            phone         TEXT,
+            joined        INTEGER DEFAULT 0,
+            discovered_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_seen_links (
+            link    TEXT PRIMARY KEY,
+            seen_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_keywords (
+            word TEXT PRIMARY KEY
+        )
+        """
+    )
 
     # ---- migration: add accounts.worker_id (account -> worker affinity) ----
     cols = [r["name"] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
@@ -1850,3 +1886,127 @@ def tg_mark_sent(user_id):
                  (user_id, _now()))
     conn.commit()
     conn.close()
+
+
+
+# =========================================================================== #
+# YoudonoaAx — Telegram engines (join / comment / sniper / secretary) helpers.
+# =========================================================================== #
+# ---- source (linkdooni/tabchi) channels for the join + comment engines ----
+def tg_add_link_channel(ref: str) -> bool:
+    ref = (ref or "").strip()
+    if not ref:
+        return False
+    conn = _conn()
+    try:
+        conn.execute("INSERT OR IGNORE INTO tg_link_channels (ref, added_at) "
+                     "VALUES (?,?)", (ref, _now()))
+        conn.commit()
+        changed = conn.total_changes > 0
+    finally:
+        conn.close()
+    return changed
+
+
+def tg_list_link_channels() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM tg_link_channels ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def tg_clear_link_channels():
+    conn = _conn()
+    conn.execute("DELETE FROM tg_link_channels")
+    conn.commit()
+    conn.close()
+
+
+# ---- discovered/joined groups + link dedup ----
+def tg_seen_link(link: str) -> bool:
+    """Record a link; return True if NEW (not seen before)."""
+    link = (link or "").strip()
+    if not link:
+        return False
+    conn = _conn()
+    try:
+        conn.execute("INSERT OR IGNORE INTO tg_seen_links (link, seen_at) VALUES (?,?)",
+                     (link, _now()))
+        conn.commit()
+        is_new = conn.total_changes > 0
+    finally:
+        conn.close()
+    return is_new
+
+
+def tg_add_group(gid, link, phone, title=""):
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO tg_groups (gid, link, title, phone, joined, discovered_at) "
+        "VALUES (?,?,?,?,1,?) ON CONFLICT(gid) DO UPDATE SET phone=excluded.phone, "
+        "joined=1, title=excluded.title",
+        (gid, link, title, phone, _now()))
+    conn.commit()
+    conn.close()
+
+
+def tg_list_groups(phone=None) -> list:
+    conn = _conn()
+    if phone:
+        rows = conn.execute("SELECT * FROM tg_groups WHERE phone=? AND joined=1",
+                            (phone,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM tg_groups WHERE joined=1").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---- lead-sniper keywords ----
+def tg_add_keyword(word: str):
+    word = (word or "").strip()
+    if not word:
+        return
+    conn = _conn()
+    conn.execute("INSERT OR IGNORE INTO tg_keywords (word) VALUES (?)", (word,))
+    conn.commit()
+    conn.close()
+
+
+def tg_list_keywords() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT word FROM tg_keywords ORDER BY word").fetchall()
+    conn.close()
+    return [r["word"] for r in rows]
+
+
+def tg_clear_keywords():
+    conn = _conn()
+    conn.execute("DELETE FROM tg_keywords")
+    conn.commit()
+    conn.close()
+
+
+# ---- secretary (PV auto-reply) content + flags (settings-backed) ----
+def tg_set_secretary_content(text="", media="", caption=""):
+    set_setting("tg_sec_text", text or "")
+    set_setting("tg_sec_media", media or "")
+    set_setting("tg_sec_caption", caption or "")
+
+
+def tg_get_secretary_content() -> dict:
+    return {"text": get_setting("tg_sec_text", "") or "",
+            "media": get_setting("tg_sec_media", "") or "",
+            "caption": get_setting("tg_sec_caption", "") or ""}
+
+
+# ---- comment-engine text (reuses tg_texts kind='comment') ----
+def tg_add_comment_text(text):
+    tg_add_text(text, "comment")
+
+
+def tg_list_comment_texts() -> list:
+    return tg_list_texts("comment")
+
+
+def tg_clear_comment_texts():
+    tg_clear_texts("comment")
