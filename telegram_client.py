@@ -266,6 +266,19 @@ async def send_content(client: TelegramClient, entity, text: str = "",
     return await send_text(client, entity, text, typing)
 
 
+async def upload_to_saved(client: TelegramClient, file_path: str, caption: str = ""):
+    """Upload a media file ONCE to the account's own Saved Messages and return
+    the resulting Message. The file is then FORWARDED to every recipient, so it
+    is uploaded a single time instead of re-uploaded per chat (much faster)."""
+    return await safe_call(
+        lambda: client.send_file("me", file_path, caption=caption or None))
+
+
+async def forward_to(client: TelegramClient, entity, message):
+    """Forward an already-sent (Saved-Messages) message to a chat — no re-upload."""
+    return await safe_call(lambda: client.forward_messages(entity, message))
+
+
 # --------------------------------------------------------------------------- #
 # Group / channel join + comment / forced-membership helpers (phases 3-5).
 # --------------------------------------------------------------------------- #

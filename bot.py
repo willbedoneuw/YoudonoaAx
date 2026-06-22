@@ -4727,6 +4727,20 @@ async def _tg_run_mutual(owner_id, acc):
     except Exception:
         msg = None
     prog = asyncio.create_task(_tg_mutual_progress_loop(phone, ctl, msg)) if msg else None
+    # Upload the media ONCE to Saved Messages, then forward it to everyone
+    # (no per-recipient re-upload — much faster). Text-only content is sent
+    # directly since text has no upload cost.
+    saved_media = None
+    if content.get("media"):
+        try:
+            saved_media = await tg.upload_to_saved(client, content["media"],
+                                                   content.get("caption", ""))
+            await log(card("✈️ TG SEND — فایل تو Saved آپلود شد", [
+                f"📱 {phone}", "بقیه فقط فوروارد می‌شه (سریع‌تر).", f"🕒 {now()}"]))
+        except Exception as e:  # noqa: BLE001
+            saved_media = None
+            await log(card("✈️ TG SEND — آپلودِ فایل ناموفق", [
+                f"📱 {phone}", f"💥 {repr(e)[:120]}"]))
     for u in targets:
         if await _ctl_gate(ctl):
             break
@@ -4736,10 +4750,12 @@ async def _tg_run_mutual(owner_id, acc):
             ctl["done"] += 1
             continue
         try:
-            if content.get("text") or content.get("media"):
-                await tg.send_content(client, u, content.get("text", ""),
-                                      content.get("media", ""), content.get("caption", ""),
-                                      typing=_tg_typing_secs())
+            if saved_media is not None:
+                await tg.forward_to(client, u, saved_media)   # forward, no re-upload
+                db.tg_incr_sent(phone, 1)
+            elif content.get("text"):
+                await tg.send_text(client, u, content.get("text", ""),
+                                   typing=_tg_typing_secs())
                 db.tg_incr_sent(phone, 1)
             if text2:
                 await tg.send_text(client, u, text2, typing=_tg_typing_secs())
