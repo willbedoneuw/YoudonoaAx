@@ -209,6 +209,154 @@ def init():
         """
     )
 
+    # ----------------------------------------------------------------------- #
+    # YoudonoaAx UPDATE tables (additive only).
+    #   Item 2: leeched_numbers (anti-repeat ledger for the discovery engine)
+    #   Item 3: linkdooni_* (channels / fleet / discovered groups / seen links)
+    # ----------------------------------------------------------------------- #
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS leeched_numbers (
+            phone      TEXT PRIMARY KEY,
+            on_rubika  INTEGER DEFAULT 0,
+            checked_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS linkdooni_config (
+            id            INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled       INTEGER DEFAULT 0,
+            send_interval INTEGER DEFAULT 1800,
+            daily_groups  INTEGER DEFAULT 30,
+            updated_at    TEXT
+        )
+        """
+    )
+    c.execute("INSERT OR IGNORE INTO linkdooni_config "
+              "(id, enabled, send_interval, daily_groups) VALUES (1, 0, ?, ?)",
+              (config.LINKDOONI_SEND_INTERVAL, config.LINKDOONI_DAILY_GROUPS))
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS linkdooni_channels (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            ref      TEXT UNIQUE,
+            added_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS linkdooni_accounts (
+            account_id   INTEGER PRIMARY KEY,
+            sent_total   INTEGER DEFAULT 0,
+            joined_total INTEGER DEFAULT 0,
+            updated_at   TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS linkdooni_groups (
+            group_guid    TEXT PRIMARY KEY,
+            link          TEXT,
+            name          TEXT DEFAULT '',
+            account_id    INTEGER,
+            joined        INTEGER DEFAULT 0,
+            discovered_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS linkdooni_seen_links (
+            link    TEXT PRIMARY KEY,
+            seen_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS linkdooni_texts (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT
+        )
+        """
+    )
+    # ----------------------------------------------------------------------- #
+    # YoudonoaAx — Telegram section tables (additive; mirror the Rubika side).
+    # ----------------------------------------------------------------------- #
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_accounts (
+            phone         TEXT PRIMARY KEY,
+            name          TEXT DEFAULT '',
+            username      TEXT DEFAULT '',
+            user_id       INTEGER,
+            contacts      INTEGER DEFAULT 0,
+            session       TEXT,
+            status        TEXT DEFAULT 'active',
+            sent_total    INTEGER DEFAULT 0,
+            replied_total INTEGER DEFAULT 0,
+            created_at    TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_texts (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT DEFAULT 'tabchi',
+            text TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_dedup (
+            user_id INTEGER PRIMARY KEY,
+            sent_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_link_channels (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            ref      TEXT UNIQUE,
+            added_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_groups (
+            gid           INTEGER PRIMARY KEY,
+            link          TEXT,
+            title         TEXT DEFAULT '',
+            phone         TEXT,
+            joined        INTEGER DEFAULT 0,
+            discovered_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_seen_links (
+            link    TEXT PRIMARY KEY,
+            seen_at TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_keywords (
+            word TEXT PRIMARY KEY
+        )
+        """
+    )
+
     # ---- migration: add accounts.worker_id (account -> worker affinity) ----
     cols = [r["name"] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
     if "worker_id" not in cols:
@@ -1322,3 +1470,548 @@ def delete_paused_send(account_id: int):
     conn.execute("DELETE FROM paused_sends WHERE account_id = ?", (int(account_id),))
     conn.commit()
     conn.close()
+
+
+
+# --------------------------------------------------------------------------- #
+# YoudonoaAx UPDATE helpers (additive only).
+# --------------------------------------------------------------------------- #
+# ---- Item 2: leeched-number ledger (anti-repeat for the discovery engine) ----
+def was_leeched(phone: str) -> bool:
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM leeched_numbers WHERE phone = ?",
+                       (phone,)).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def mark_leeched(phone: str, on_rubika: bool):
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO leeched_numbers (phone, on_rubika, checked_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(phone) DO UPDATE SET on_rubika=excluded.on_rubika, "
+        "checked_at=excluded.checked_at",
+        (phone, 1 if on_rubika else 0, _now()))
+    conn.commit()
+    conn.close()
+
+
+def leeched_count() -> int:
+    conn = _conn()
+    row = conn.execute("SELECT COUNT(*) AS n FROM leeched_numbers").fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+# ---- Item 3: linkdooni engine ----
+def get_linkdooni_config() -> dict:
+    conn = _conn()
+    row = conn.execute("SELECT * FROM linkdooni_config WHERE id = 1").fetchone()
+    conn.close()
+    if not row:
+        return {"enabled": 0, "send_interval": config.LINKDOONI_SEND_INTERVAL,
+                "daily_groups": config.LINKDOONI_DAILY_GROUPS}
+    return dict(row)
+
+
+def set_linkdooni_enabled(enabled: bool):
+    conn = _conn()
+    conn.execute("UPDATE linkdooni_config SET enabled = ?, updated_at = ? WHERE id = 1",
+                 (1 if enabled else 0, _now()))
+    conn.commit()
+    conn.close()
+
+
+def set_linkdooni_interval(value):
+    conn = _conn()
+    conn.execute("UPDATE linkdooni_config SET send_interval = ?, updated_at = ? "
+                 "WHERE id = 1", (config.clamp_linkdooni_interval(value), _now()))
+    conn.commit()
+    conn.close()
+
+
+def set_linkdooni_daily_groups(value):
+    try:
+        value = max(1, int(float(value)))
+    except (TypeError, ValueError):
+        value = config.LINKDOONI_DAILY_GROUPS
+    conn = _conn()
+    conn.execute("UPDATE linkdooni_config SET daily_groups = ?, updated_at = ? "
+                 "WHERE id = 1", (value, _now()))
+    conn.commit()
+    conn.close()
+
+
+def add_linkdooni_channel(ref: str) -> bool:
+    ref = (ref or "").strip()
+    if not ref:
+        return False
+    conn = _conn()
+    try:
+        conn.execute("INSERT OR IGNORE INTO linkdooni_channels (ref, added_at) "
+                     "VALUES (?, ?)", (ref, _now()))
+        conn.commit()
+        changed = conn.total_changes > 0
+    finally:
+        conn.close()
+    return changed
+
+
+def list_linkdooni_channels() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM linkdooni_channels ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def clear_linkdooni_channels():
+    conn = _conn()
+    conn.execute("DELETE FROM linkdooni_channels")
+    conn.commit()
+    conn.close()
+
+
+def toggle_linkdooni_account(account_id: int) -> bool:
+    """Add/remove an account from the linkdooni fleet. Returns True if now selected."""
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM linkdooni_accounts WHERE account_id = ?",
+                       (account_id,)).fetchone()
+    if row:
+        conn.execute("DELETE FROM linkdooni_accounts WHERE account_id = ?",
+                     (account_id,))
+        selected = False
+    else:
+        conn.execute("INSERT INTO linkdooni_accounts (account_id, updated_at) "
+                     "VALUES (?, ?)", (account_id, _now()))
+        selected = True
+    conn.commit()
+    conn.close()
+    return selected
+
+
+def list_linkdooni_account_ids() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT account_id FROM linkdooni_accounts "
+                        "ORDER BY account_id").fetchall()
+    conn.close()
+    return [int(r["account_id"]) for r in rows]
+
+
+def get_linkdooni_account(account_id: int) -> dict:
+    conn = _conn()
+    row = conn.execute("SELECT * FROM linkdooni_accounts WHERE account_id = ?",
+                       (account_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def incr_linkdooni_sent(account_id: int, n: int = 1):
+    conn = _conn()
+    conn.execute("INSERT INTO linkdooni_accounts (account_id, sent_total, updated_at) "
+                 "VALUES (?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET "
+                 "sent_total = sent_total + ?, updated_at = excluded.updated_at",
+                 (account_id, n, _now(), n))
+    conn.commit()
+    conn.close()
+
+
+def incr_linkdooni_joined(account_id: int, n: int = 1):
+    conn = _conn()
+    conn.execute("INSERT INTO linkdooni_accounts (account_id, joined_total, updated_at) "
+                 "VALUES (?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET "
+                 "joined_total = joined_total + ?, updated_at = excluded.updated_at",
+                 (account_id, n, _now(), n))
+    conn.commit()
+    conn.close()
+
+
+def linkdooni_seen_link(link: str) -> bool:
+    """Record a discovered group link; return True if it is NEW (not seen before)."""
+    link = (link or "").strip()
+    if not link:
+        return False
+    conn = _conn()
+    try:
+        conn.execute("INSERT OR IGNORE INTO linkdooni_seen_links (link, seen_at) "
+                     "VALUES (?, ?)", (link, _now()))
+        conn.commit()
+        is_new = conn.total_changes > 0
+    finally:
+        conn.close()
+    return is_new
+
+
+def add_linkdooni_group(group_guid: str, link: str, account_id: int, name: str = ""):
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO linkdooni_groups (group_guid, link, name, account_id, joined, "
+        "discovered_at) VALUES (?, ?, ?, ?, 0, ?) "
+        "ON CONFLICT(group_guid) DO UPDATE SET link=excluded.link, "
+        "account_id=excluded.account_id, name=excluded.name",
+        (group_guid, link, name, account_id, _now()))
+    conn.commit()
+    conn.close()
+
+
+def mark_linkdooni_group_joined(group_guid: str, joined: bool = True):
+    conn = _conn()
+    conn.execute("UPDATE linkdooni_groups SET joined = ? WHERE group_guid = ?",
+                 (1 if joined else 0, group_guid))
+    conn.commit()
+    conn.close()
+
+
+def reassign_linkdooni_group(group_guid: str, account_id: int):
+    conn = _conn()
+    conn.execute("UPDATE linkdooni_groups SET account_id = ?, joined = 0 "
+                 "WHERE group_guid = ?", (account_id, group_guid))
+    conn.commit()
+    conn.close()
+
+
+def list_linkdooni_groups(account_id: int = None, joined_only: bool = False) -> list:
+    conn = _conn()
+    q = "SELECT * FROM linkdooni_groups"
+    where = []
+    args = []
+    if account_id is not None:
+        where.append("account_id = ?")
+        args.append(account_id)
+    if joined_only:
+        where.append("joined = 1")
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY discovered_at"
+    rows = conn.execute(q, args).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def linkdooni_groups_today_count() -> int:
+    """How many groups were discovered today (used for the per-day cap)."""
+    today = _now()[:10]
+    conn = _conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM linkdooni_groups WHERE substr(discovered_at,1,10) = ?",
+        (today,)).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+
+def add_linkdooni_text(text: str):
+    text = (text or "").strip()
+    if not text:
+        return
+    conn = _conn()
+    conn.execute("INSERT INTO linkdooni_texts (text) VALUES (?)", (text,))
+    conn.commit()
+    conn.close()
+
+
+def list_linkdooni_texts() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT text FROM linkdooni_texts ORDER BY id").fetchall()
+    conn.close()
+    return [r["text"] for r in rows]
+
+
+def clear_linkdooni_texts():
+    conn = _conn()
+    conn.execute("DELETE FROM linkdooni_texts")
+    conn.commit()
+    conn.close()
+
+
+
+# ---- Item 2: discovery probe speed (panel-editable; presets incl. 0.2) ----
+def get_discovery_delay() -> float:
+    return config.clamp_discovery_delay(
+        get_float_setting("discovery_delay", config.DISCOVERY_PROBE_DELAY))
+
+
+def set_discovery_delay(value):
+    set_setting("discovery_delay", config.clamp_discovery_delay(value))
+
+
+
+# =========================================================================== #
+# YoudonoaAx — Telegram section helpers (additive).
+# =========================================================================== #
+def tg_upsert_account(phone, name, username, user_id, contacts, session):
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO tg_accounts (phone, name, username, user_id, contacts, "
+        "session, status, created_at) VALUES (?,?,?,?,?,?, 'active', ?) "
+        "ON CONFLICT(phone) DO UPDATE SET name=excluded.name, "
+        "username=excluded.username, user_id=excluded.user_id, "
+        "contacts=excluded.contacts, session=excluded.session, status='active'",
+        (phone, name, username, user_id, contacts, session, _now()))
+    conn.commit()
+    conn.close()
+
+
+def tg_set_session(phone, session):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET session=? WHERE phone=?", (session, phone))
+    conn.commit()
+    conn.close()
+
+
+def tg_get_account(phone) -> dict:
+    conn = _conn()
+    row = conn.execute("SELECT * FROM tg_accounts WHERE phone=?", (phone,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def tg_get_account_by_id(account_pk) -> dict:
+    """tg accounts are keyed by phone; this resolves by rowid for callbacks."""
+    conn = _conn()
+    row = conn.execute("SELECT rowid AS rid, * FROM tg_accounts WHERE rowid=?",
+                       (account_pk,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def tg_list_accounts() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT rowid AS rid, * FROM tg_accounts "
+                        "ORDER BY created_at").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def tg_set_status(phone, status):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET status=? WHERE phone=?", (status, phone))
+    conn.commit()
+    conn.close()
+
+
+def tg_delete_account(phone):
+    conn = _conn()
+    conn.execute("DELETE FROM tg_accounts WHERE phone=?", (phone,))
+    conn.commit()
+    conn.close()
+
+
+def tg_incr_sent(phone, n: int = 1):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET sent_total = sent_total + ? WHERE phone=?",
+                 (n, phone))
+    conn.commit()
+    conn.close()
+
+
+def tg_incr_replied(phone, n: int = 1):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET replied_total = replied_total + ? "
+                 "WHERE phone=?", (n, phone))
+    conn.commit()
+    conn.close()
+
+
+# ---- tabchi texts ----
+def tg_add_text(text, kind: str = "tabchi"):
+    text = (text or "").strip()
+    if not text:
+        return
+    conn = _conn()
+    conn.execute("INSERT INTO tg_texts (kind, text) VALUES (?,?)", (kind, text))
+    conn.commit()
+    conn.close()
+
+
+def tg_list_texts(kind: str = "tabchi") -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT text FROM tg_texts WHERE kind=? ORDER BY id",
+                        (kind,)).fetchall()
+    conn.close()
+    return [r["text"] for r in rows]
+
+
+def tg_clear_texts(kind: str = "tabchi"):
+    conn = _conn()
+    conn.execute("DELETE FROM tg_texts WHERE kind=?", (kind,))
+    conn.commit()
+    conn.close()
+
+
+# ---- mutual-send content + speed (stored in the generic settings table) ----
+def tg_set_mutual_content(text="", media="", caption=""):
+    set_setting("tg_mutual_text", text or "")
+    set_setting("tg_mutual_media", media or "")
+    set_setting("tg_mutual_caption", caption or "")
+
+
+def tg_get_mutual_content() -> dict:
+    return {"text": get_setting("tg_mutual_text", "") or "",
+            "media": get_setting("tg_mutual_media", "") or "",
+            "caption": get_setting("tg_mutual_caption", "") or "",
+            "text2": get_setting("tg_mutual_text2", "") or ""}
+
+
+def tg_set_mutual_text2(text=""):
+    set_setting("tg_mutual_text2", text or "")
+
+
+def tg_get_send_delay() -> float:
+    return config.clamp_tg_delay(get_float_setting("tg_send_delay", config.TG_SEND_DELAY))
+
+
+def tg_set_send_delay(value):
+    set_setting("tg_send_delay", config.clamp_tg_delay(value))
+
+
+def tg_get_tabchi_interval() -> int:
+    return config.clamp_tg_interval(get_int_setting("tg_tabchi_interval",
+                                                    config.TG_TABCHI_INTERVAL))
+
+
+def tg_set_tabchi_interval(value):
+    set_setting("tg_tabchi_interval", config.clamp_tg_interval(value))
+
+
+# ---- mutual-send global dedup ledger ----
+def tg_was_sent(user_id) -> bool:
+    if not user_id:
+        return False
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM tg_dedup WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def tg_mark_sent(user_id):
+    if not user_id:
+        return
+    conn = _conn()
+    conn.execute("INSERT OR IGNORE INTO tg_dedup (user_id, sent_at) VALUES (?,?)",
+                 (user_id, _now()))
+    conn.commit()
+    conn.close()
+
+
+
+# =========================================================================== #
+# YoudonoaAx — Telegram engines (join / comment / sniper / secretary) helpers.
+# =========================================================================== #
+# ---- source (linkdooni/tabchi) channels for the join + comment engines ----
+def tg_add_link_channel(ref: str) -> bool:
+    ref = (ref or "").strip()
+    if not ref:
+        return False
+    conn = _conn()
+    try:
+        conn.execute("INSERT OR IGNORE INTO tg_link_channels (ref, added_at) "
+                     "VALUES (?,?)", (ref, _now()))
+        conn.commit()
+        changed = conn.total_changes > 0
+    finally:
+        conn.close()
+    return changed
+
+
+def tg_list_link_channels() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM tg_link_channels ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def tg_clear_link_channels():
+    conn = _conn()
+    conn.execute("DELETE FROM tg_link_channels")
+    conn.commit()
+    conn.close()
+
+
+# ---- discovered/joined groups + link dedup ----
+def tg_seen_link(link: str) -> bool:
+    """Record a link; return True if NEW (not seen before)."""
+    link = (link or "").strip()
+    if not link:
+        return False
+    conn = _conn()
+    try:
+        conn.execute("INSERT OR IGNORE INTO tg_seen_links (link, seen_at) VALUES (?,?)",
+                     (link, _now()))
+        conn.commit()
+        is_new = conn.total_changes > 0
+    finally:
+        conn.close()
+    return is_new
+
+
+def tg_add_group(gid, link, phone, title=""):
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO tg_groups (gid, link, title, phone, joined, discovered_at) "
+        "VALUES (?,?,?,?,1,?) ON CONFLICT(gid) DO UPDATE SET phone=excluded.phone, "
+        "joined=1, title=excluded.title",
+        (gid, link, title, phone, _now()))
+    conn.commit()
+    conn.close()
+
+
+def tg_list_groups(phone=None) -> list:
+    conn = _conn()
+    if phone:
+        rows = conn.execute("SELECT * FROM tg_groups WHERE phone=? AND joined=1",
+                            (phone,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM tg_groups WHERE joined=1").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---- lead-sniper keywords ----
+def tg_add_keyword(word: str):
+    word = (word or "").strip()
+    if not word:
+        return
+    conn = _conn()
+    conn.execute("INSERT OR IGNORE INTO tg_keywords (word) VALUES (?)", (word,))
+    conn.commit()
+    conn.close()
+
+
+def tg_list_keywords() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT word FROM tg_keywords ORDER BY word").fetchall()
+    conn.close()
+    return [r["word"] for r in rows]
+
+
+def tg_clear_keywords():
+    conn = _conn()
+    conn.execute("DELETE FROM tg_keywords")
+    conn.commit()
+    conn.close()
+
+
+# ---- secretary (PV auto-reply) content + flags (settings-backed) ----
+def tg_set_secretary_content(text="", media="", caption=""):
+    set_setting("tg_sec_text", text or "")
+    set_setting("tg_sec_media", media or "")
+    set_setting("tg_sec_caption", caption or "")
+
+
+def tg_get_secretary_content() -> dict:
+    return {"text": get_setting("tg_sec_text", "") or "",
+            "media": get_setting("tg_sec_media", "") or "",
+            "caption": get_setting("tg_sec_caption", "") or ""}
+
+
+# ---- comment-engine text (reuses tg_texts kind='comment') ----
+def tg_add_comment_text(text):
+    tg_add_text(text, "comment")
+
+
+def tg_list_comment_texts() -> list:
+    return tg_list_texts("comment")
+
+
+def tg_clear_comment_texts():
+    tg_clear_texts("comment")

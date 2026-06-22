@@ -34,6 +34,7 @@ import rubika_client as rb
 import worker
 import account_conn
 import features
+import telegram_client as tg
 
 # Make sure the data dir exists BEFORE the Telethon session file is created.
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -97,6 +98,22 @@ automation_tasks: dict = {}
 secretary_tasks: dict = {}
 reply_tasks: dict = {}
 channelreport_tasks: dict = {}
+# YoudonoaAx UPDATE: live-control jobs keyed by account_id.
+#   contact_jobs  -> Item 1 (contact import) + Item 2 (discovery) live controls
+#   linkdooni_tasks -> Item 3 per-account send loops {account_id: {task,state}}
+contact_jobs: dict = {}
+linkdooni_tasks: dict = {}
+linkdooni_engine: dict = {}        # {"task": Task, "stop": bool} for the orchestrator
+# YoudonoaAx — Telegram section state (additive; never touches Rubika dicts).
+tg_pending: dict = {}              # owner_id -> login ctx (code/password phase)
+tg_jobs: dict = {}                 # phone -> live mutual-send control dict
+tg_tabchi_tasks: dict = {}         # phone -> {"task":Task, "state":dict}
+tg_stats: dict = {}                # live tabchi pinned-stats card state
+tg_pv_counts: dict = {}            # phone -> incoming-PV count (secretary)
+tg_sniper: dict = {"on": False, "handlers": {}}      # lead sniper handlers per phone
+tg_secretary: dict = {"on": False, "handlers": {}, "seen": {}}  # PV auto-reply
+tg_join_engine: dict = {"task": None, "stop": False}
+tg_comment_engine: dict = {"task": None, "stop": False}
 
 
 def _alert_word(n: int) -> str:
@@ -255,6 +272,7 @@ def main_menu(owner: bool = True):
          Button.inline("🧠 مغز", b"brain")],
         [Button.inline("➕ افزودن مخاطب", b"contacts"),
          Button.inline("⚙️ تنظیمات", b"settings")],
+        [Button.inline("✈️ تلگرام", b"tg")],
     ]
     if owner:
         rows.append([Button.inline("👥 مدیریت ادمین", b"admins")])
@@ -906,6 +924,42 @@ async def message_router(event):
         await handle_set_senddelay(event, st)
     elif step == "await_set_contactspeed":
         await handle_set_contactspeed(event, st)
+    elif step == "await_discover_prefix":
+        await handle_discover_prefix(event, st)
+    elif step == "await_discover_text":
+        await handle_discover_text(event, st)
+    elif step == "await_ld_channels":
+        await handle_ld_channels(event, st)
+    elif step == "await_ld_text":
+        await handle_ld_text(event, st)
+    elif step == "await_ld_interval":
+        await handle_ld_interval(event, st)
+    elif step == "await_ld_daily":
+        await handle_ld_daily(event, st)
+    elif step == "await_tg_phone":
+        await handle_tg_phone(event)
+    elif step == "await_tg_code":
+        await handle_tg_code(event)
+    elif step == "await_tg_password":
+        await handle_tg_password(event)
+    elif step == "await_tg_tabchi_text":
+        await handle_tg_tabchi_text(event)
+    elif step == "await_tg_mutual_content":
+        await handle_tg_mutual_content(event)
+    elif step == "await_tg_speed":
+        await handle_tg_speed(event)
+    elif step == "await_tg_interval":
+        await handle_tg_interval(event)
+    elif step == "await_tg_link_channels":
+        await handle_tg_link_channels(event)
+    elif step == "await_tg_keyword":
+        await handle_tg_keyword(event)
+    elif step == "await_tg_comment_text":
+        await handle_tg_comment_text(event)
+    elif step == "await_tg_secretary_content":
+        await handle_tg_secretary_content(event)
+    elif step == "await_tg_text2":
+        await handle_tg_text2(event)
 
 
 async def handle_delay(event):
@@ -1206,6 +1260,11 @@ async def run_send(owner_id: int, payload: dict):
     start_idx = int(payload.get("start_idx") or 0)
     base_ok = int(payload.get("base_ok") or 0)
     suppress_panel = bool(payload.get("suppress_resume_panel"))
+    # YoudonoaAx UPDATE (Item 2): the send pipeline can either forward the
+    # marked Saved-Messages post ('marker' mode, the original behaviour) or send
+    # a custom configured text ('text' mode). Default stays 'marker'.
+    mode = (payload.get("mode") or "marker").lower()
+    send_body = payload.get("text") or ""
     marker = db.get_marker()
     delay = db.get_delay()
     max_errors = db.get_max_errors()
@@ -1231,7 +1290,8 @@ async def run_send(owner_id: int, payload: dict):
         f"🎯 Targets : {total}" + (f"  (ادامه از {start_idx})" if start_idx else ""),
         f"⏱ Delay : {delay}s",
         f"🧯 Max consecutive errors : {max_errors}",
-        f"📌 Marker : «{marker}» Found ✅",
+        (f"✍️ Mode : متن دلخواه" if mode == "text"
+         else f"📌 Marker : «{marker}» Found ✅"),
     ]))
 
     n = total
@@ -1253,10 +1313,16 @@ async def run_send(owner_id: int, payload: dict):
                 guid = recipients[idx]
                 idx += 1
                 try:
-                    await asyncio.wait_for(
-                        rb.forward_message(client, saved_guid, guid, mid),
-                        timeout=config.SEND_TIMEOUT,
-                    )
+                    if mode == "text":
+                        await asyncio.wait_for(
+                            rb.send_text(client, guid, send_body),
+                            timeout=config.SEND_TIMEOUT,
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            rb.forward_message(client, saved_guid, guid, mid),
+                            timeout=config.SEND_TIMEOUT,
+                        )
                     ok += 1
                     attempt_fail = 0          # count CONSECUTIVE errors only
                     done_ok = base_ok + ok
@@ -1348,16 +1414,21 @@ async def run_send(owner_id: int, payload: dict):
     if dead:
         db.set_status(account_id, "inactive")
 
+    # YoudonoaAx UPDATE (Item 2): success-rate % shown in the report card.
+    _attempted = grand_ok + fail
+    success_pct = int(grand_ok * 100 / _attempted) if _attempted else 0
+
     if reason:
         await log(card("⛔ SEND STOPPED", [
             f"{_lbl()}👤 Account : {phone}",
             f"📊 ✅ {grand_ok}   ❌ {fail}   📁 {base_ok + total}",
+            f"📈 نرخ موفقیت : {success_pct}%   (ناموفق: {fail})",
             f"⚠️ Reason : {reason}",
             f"⏱ Duration : {dur}",
             f"🕒 {now()}",
         ]))
         try:
-            await bot.send_message(owner_id, f"⛔ ارسال متوقف شد. ✅ {grand_ok} / ❌ {fail}\nدلیل: {reason}",
+            await bot.send_message(owner_id, f"⛔ ارسال متوقف شد. ✅ {grand_ok} / ❌ {fail} — نرخ موفقیت {success_pct}%\nدلیل: {reason}",
                                    buttons=main_menu(owner_id == config.OWNER_ID))
         except Exception:
             pass
@@ -1367,10 +1438,11 @@ async def run_send(owner_id: int, payload: dict):
             f"{_lbl()}👤 Account : {phone}",
             LINE,
             f"✅ {grand_ok}   ❌ {fail}   📁 {base_ok + total}",
+            f"📈 نرخ موفقیت : {success_pct}%   (ناموفق: {fail})",
             f"⏱ Duration : {dur}",
         ]))
         try:
-            await bot.send_message(owner_id, f"✅ ارسال تمام شد. ✅ {grand_ok} / ❌ {fail}",
+            await bot.send_message(owner_id, f"✅ ارسال تمام شد. ✅ {grand_ok} / ❌ {fail} — نرخ موفقیت {success_pct}%",
                                    buttons=main_menu(owner_id == config.OWNER_ID))
         except Exception:
             pass
@@ -2329,6 +2401,7 @@ async def automation_menu_cb(event):
         rows.append([Button.inline(f"{'🟢' if on else '⚪️'} {a['phone']}",
                                    f"auto_{a['id']}".encode())])
     rows.append([Button.inline("🪪 سینک اسم/بیو همه اکانت‌ها", b"psync")])
+    rows.append([Button.inline("📨 لینکدونی (موتور گروه‌ها)", b"linkdooni")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     await safe_edit(event, "🔁 اتومیشن — یک اکانت انتخاب کن:", buttons=rows)
 
@@ -4123,6 +4196,1478 @@ async def health_loop():
         await asyncio.sleep(quick)
 
 
+# =========================================================================== #
+# ✈️ TELEGRAM SECTION (additive — mirrors the Rubika side, never touches it)
+# Built with Telethon userbots, reusing config.API_ID / config.API_HASH.
+# Phases delivered here: foundation+login, send-to-mutual-contacts (text/media
+# +caption, speed 0.2-1, live stats), and concurrent tabchi (group posting,
+# text config, group-count at start, pinned live stats, human typing).
+# =========================================================================== #
+TG_MEDIA_DIR = os.path.join(DATA_DIR, "tg_media")
+
+
+def _tg_typing_secs() -> float:
+    return random.uniform(config.TG_TYPING_MIN, config.TG_TYPING_MAX)
+
+
+def _tg_menu_buttons():
+    """Simple navigation back into the Telegram panel (used after config saves)."""
+    return [[Button.inline("🔙 پنل تلگرام", b"tg")]]
+
+
+def _tg_acc_on(phone: str) -> bool:
+    return (phone in tg_tabchi_tasks or phone in tg_secretary["handlers"]
+            or phone in tg_sniper["handlers"])
+
+
+@bot.on(events.CallbackQuery(data=b"tg"))
+async def tg_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    accs = db.tg_list_accounts()
+    rows = []
+    for a in accs:
+        if a["status"] != "active":
+            mark = "🔴"
+        else:
+            mark = "🟢" if _tg_acc_on(a["phone"]) else "⚪️"
+        rows.append([Button.inline(f"{mark} {a['phone']} — {a['name']}",
+                                   f"tgacc_{a['rid']}".encode())])
+    rows.append([Button.inline("🌐 مدیریت همگانی (تبچی/منشی/جوین)", b"tgfleet")])
+    rows.append([Button.inline("➕ افزودن اکانت", b"tgadd")])
+    rows.append([Button.inline("🔙 بازگشت به روبیکا", b"home")])
+    head = card("✈️ پنل تلگرام", [
+        f"👤 اکانت‌ها : {len(accs)}",
+        "یک اکانت انتخاب کن — همه‌چیزش (ارسال/تبچی/منشی/سنایپر/جوین/کامنت) تو یک صفحه‌ست.",
+    ])
+    await safe_edit(event, head, buttons=rows)
+
+
+# ----- login -----
+@bot.on(events.CallbackQuery(data=b"tgfleet"))
+async def tg_fleet_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    active = len([a for a in db.tg_list_accounts() if a["status"] == "active"])
+    await safe_edit(event, card("🌐 مدیریت همگانیِ تلگرام", [
+        f"👤 اکانت‌های فعال : {active}",
+        f"🔁 تبچیِ روشن : {len(tg_tabchi_tasks)}    🤖 منشی : {len(tg_secretary['handlers'])}"
+        f"    🎯 سنایپر : {len(tg_sniper['handlers'])}",
+        "تبچی رو روی چند اکانت با هم روشن کن، لینکِ گروه بده تا همه جوین شن، متن/منشی بذار.",
+    ]), buttons=[
+        [Button.inline("🔁 تبچیِ همگانی (انتخاب اکانت‌ها)", b"tgtabchi")],
+        [Button.inline("⏹ توقفِ همهٔ تبچی‌ها", b"tgtaballoff")],
+        [Button.inline("▶️ منشیِ همه", b"tgsecon"),
+         Button.inline("⏹ منشیِ همه", b"tgsecoff")],
+        [Button.inline("▶️ سنایپرِ همه", b"tgsnipon"),
+         Button.inline("⏹ سنایپرِ همه", b"tgsnipoff")],
+        [Button.inline("🔗 جوین گروه (لینک بده)", b"tgjoin"),
+         Button.inline("💬 کامنت‌انجین", b"tgcomment")],
+        [Button.inline("📝 متن تبچی", b"tgtext"),
+         Button.inline("🔑 کلیدواژه", b"tgkwadd"),
+         Button.inline("📦 پاسخ منشی", b"tgsecset")],
+        [Button.inline("🔙 پنل تلگرام", b"tg")],
+    ])
+
+
+@bot.on(events.CallbackQuery(data=b"tgadd"))
+async def tg_add_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_phone"}
+    await safe_edit(event,
+        "✈️ شمارهٔ اکانتِ تلگرام رو با کدِ کشور بفرست (مثلاً +98912...).",
+        buttons=[[Button.inline("🔙 لغو", b"tg")]])
+
+
+async def handle_tg_phone(event):
+    phone = event.raw_text.strip().replace(" ", "")
+    await event.respond("⏳ اتصال به تلگرام و ارسالِ کد ...")
+    try:
+        ctx = await tg.start_login(phone)
+    except Exception as e:  # noqa: BLE001
+        state.pop(event.sender_id, None)
+        await event.respond(f"❌ خطا در ارسال کد: {repr(e)[:160]}")
+        return
+    tg_pending[event.sender_id] = ctx
+    state[event.sender_id] = {"step": "await_tg_code"}
+    await event.respond("📩 کدِ ورودِ تلگرام اومد. کد رو بفرست.",
+                        buttons=[[Button.inline("🔙 لغو", b"tg")]])
+
+
+async def handle_tg_code(event):
+    ctx = tg_pending.get(event.sender_id)
+    if not ctx:
+        state.pop(event.sender_id, None)
+        return
+    code = "".join(ch for ch in event.raw_text if ch.isdigit())
+    try:
+        await tg.finish_login(ctx, code)
+    except Exception as e:  # noqa: BLE001
+        if type(e).__name__ == "SessionPasswordNeededError":
+            state[event.sender_id] = {"step": "await_tg_password"}
+            await event.respond("🔐 این اکانت رمزِ دومرحله‌ای داره. رمز رو بفرست.",
+                                buttons=[[Button.inline("🔙 لغو", b"tg")]])
+            return
+        await event.respond(f"❌ کد اشتباه/خطا: {repr(e)[:160]}\nدوباره کد رو بفرست یا لغو کن.")
+        return
+    await _tg_complete_login(event, ctx)
+
+
+async def handle_tg_password(event):
+    ctx = tg_pending.get(event.sender_id)
+    if not ctx:
+        state.pop(event.sender_id, None)
+        return
+    try:
+        await tg.finish_password(ctx, event.raw_text.strip())
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"❌ رمز اشتباه/خطا: {repr(e)[:160]}\nدوباره رمز رو بفرست.")
+        return
+    await _tg_complete_login(event, ctx)
+
+
+async def _tg_complete_login(event, ctx):
+    tg_pending.pop(event.sender_id, None)
+    state.pop(event.sender_id, None)
+    try:
+        info = await tg.commit_login(ctx)
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"❌ ثبتِ اکانت ناموفق: {repr(e)[:160]}")
+        return
+    rows = [
+        f"📱 شماره : {ctx['phone']}",
+        f"🏷 اسم : {info.get('name', '—')}",
+        f"🔖 یوزرنیم : @{info.get('username')}" if info.get("username") else "🔖 یوزرنیم : —",
+        f"👥 مخاطبین : {info.get('contacts', 0)}",
+        f"🤝 دوطرفه‌ها : {info.get('mutuals', 0)}",
+        f"👨‍👩‍👧 گروه‌ها : {info.get('groups', 0)}",
+        f"🕒 {now()}",
+    ]
+    await log(card("✈️ TELEGRAM LOGIN ✅", rows))
+    rid = next((a["rid"] for a in db.tg_list_accounts()
+                if a["phone"] == ctx["phone"]), None)
+    btns = []
+    if rid:
+        btns.append([Button.inline("⚙️ مدیریت/ارسالِ این اکانت", f"tgacc_{rid}".encode())])
+    btns.append([Button.inline("🔙 پنل تلگرام", b"tg")])
+    await event.respond(card("✈️ اکانتِ تلگرام اضافه شد ✅", rows), buttons=btns)
+
+
+# ----- account list / delete -----
+@bot.on(events.CallbackQuery(data=b"tgaccs"))
+async def tg_accounts_cb(event):
+    if not is_owner(event):
+        return
+    accs = db.tg_list_accounts()
+    if not accs:
+        await event.answer("هنوز اکانتِ تلگرامی اضافه نکردی.", alert=True)
+        return
+    rows = [[Button.inline(
+        f"{'🟢' if a['status'] == 'active' else '🔴'} {a['phone']} — {a['name']} "
+        f"(👥{a['contacts']})", f"tgacc_{a['rid']}".encode())] for a in accs]
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, "✈️ اکانت‌های تلگرام:", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgacc_(\\d+)"))
+async def tg_account_menu_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    rid = acc["rid"]
+    tab_on = phone in tg_tabchi_tasks
+    sec_on = phone in tg_secretary["handlers"]
+    snip_on = phone in tg_sniper["handlers"]
+    cont = db.tg_get_mutual_content()
+    lines = [
+        f"📱 {phone}  ({acc['name']})", LINE,
+        f"👥 مخاطبین : {acc['contacts']}    ✉️ ارسالی : {acc['sent_total']}    "
+        f"↩️ جواب : {acc['replied_total']}",
+        f"🔁 تبچی : {'🟢' if tab_on else '⚪️'}    "
+        f"🤖 منشی : {'🟢' if sec_on else '⚪️'}    "
+        f"🎯 سنایپر : {'🟢' if snip_on else '⚪️'}",
+        f"📦 محتوا : "
+        + ("🖼 فایل" if cont.get("media") else ("✍️ متن" if cont.get("text") else "—"))
+        + ("  ➕متن۲" if cont.get("text2") else "")
+        + f"    ⏱ سرعت: {db.tg_get_send_delay()}s",
+    ]
+    rows = [
+        [Button.inline("📤 ارسال به مخاطبین", f"tgrun_{rid}".encode())],
+        [Button.inline("⏹ تبچی" if tab_on else "▶️ تبچی", f"tgtabtog_{rid}".encode()),
+         Button.inline("⏹ منشی" if sec_on else "▶️ منشی", f"tgsectog_{rid}".encode()),
+         Button.inline("⏹ سنایپر" if snip_on else "▶️ سنایپر", f"tgsniptog_{rid}".encode())],
+        [Button.inline("📝 متن تبچی", b"tgtext"),
+         Button.inline("🕒 فاصله تبچی", b"tgint")],
+        [Button.inline("🔑 کلیدواژه سنایپر", b"tgkwadd"),
+         Button.inline("📦 پاسخ منشی", b"tgsecset")],
+        [Button.inline("📦 محتوا۱", b"tgmcontent"),
+         Button.inline("✍️ متن۲", b"tgtext2")],
+        [Button.inline("🔗 جوین گروه", b"tgjoin"),
+         Button.inline("💬 کامنت‌انجین", b"tgcomment")],
+        [Button.inline("🗑 حذف اکانت", f"tgdel_{rid}".encode()),
+         Button.inline("🔙 پنل تلگرام", b"tg")],
+    ]
+    await safe_edit(event, "\n".join(lines), buttons=rows)
+
+
+# ---- per-account engine toggles (integrated panel) ----
+@bot.on(events.CallbackQuery(pattern=b"tgrun_(\\d+)"))
+async def tg_run_send_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    cont = db.tg_get_mutual_content()
+    if not cont.get("text") and not cont.get("media"):
+        await event.answer("اول «📦 محتوای ارسال» رو تنظیم کن.", alert=True)
+        return
+    if phone in tg_jobs:
+        await event.answer("یه ارسال روی این اکانت در جریانه.", alert=True)
+        return
+    await safe_edit(event, f"📤 ارسال به مخاطبینِ {phone} شروع شد (اول دوطرفه‌ها). گزارش تو گپ لاگ میاد.",
+                    buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
+    asyncio.create_task(_tg_run_mutual(event.sender_id, acc))
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgtabtog_(\\d+)"))
+async def tg_tabtog_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    if phone in tg_tabchi_tasks:
+        await _tg_stop_tabchi(phone)
+        await event.answer("⏹ تبچی خاموش شد.")
+    else:
+        if not db.tg_list_texts("tabchi"):
+            await event.answer("اول «📝 متن» تبچی تنظیم کن.", alert=True)
+            return
+        try:
+            client = await tg.get_client(phone)
+            groups = await tg.get_group_entities(client)
+        except Exception as e:  # noqa: BLE001
+            await event.answer(f"اتصال ناموفق: {repr(e)[:80]}", alert=True)
+            return
+        stt = {"stop": False, "sent": 0, "groups": len(groups)}
+        tg_tabchi_tasks[phone] = {"task": asyncio.create_task(_tg_run_tabchi(phone, stt)),
+                                  "state": stt}
+        await _tg_ensure_stats_card()
+        await log(card("✈️ TG تبچی — استارت", [
+            f"📱 {phone}", f"👥 گروه‌ها : {len(groups)}", f"🕒 {now()}"]))
+        await event.answer(f"🟢 تبچی روشن شد — {len(groups)} گروه.")
+    await tg_account_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgsectog_(\\d+)"))
+async def tg_sectog_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    if phone in tg_secretary["handlers"]:
+        await _tg_stop_secretary_one(phone)
+        await log(card("🤖 منشی — خاموش", [f"📱 {phone}", f"🕒 {now()}"]))
+        await event.answer("⏹ منشی خاموش شد.")
+    else:
+        cont = db.tg_get_secretary_content()
+        if not cont.get("text") and not cont.get("media"):
+            await event.answer("اول «📦 پاسخ منشی» رو تنظیم کن.", alert=True)
+            return
+        ok = await _tg_start_secretary_one(phone)
+        if ok:
+            await log(card("🤖 منشی — روشن", [f"📱 {phone}", f"🕒 {now()}"]))
+        await event.answer("▶️ منشی روشن شد." if ok else "ناموفق.")
+    await tg_account_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgsniptog_(\\d+)"))
+async def tg_sniptog_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    if phone in tg_sniper["handlers"]:
+        await _tg_stop_sniper_one(phone)
+        await log(card("🎯 سنایپر — خاموش", [f"📱 {phone}", f"🕒 {now()}"]))
+        await event.answer("⏹ سنایپر خاموش شد.")
+    else:
+        if not db.tg_list_keywords():
+            await event.answer("اول «🔑 کلیدواژه» اضافه کن.", alert=True)
+            return
+        ok = await _tg_start_sniper_one(phone)
+        if ok:
+            await log(card("🎯 سنایپر — روشن", [
+                f"📱 {phone}", f"🔑 {', '.join(db.tg_list_keywords())}", f"🕒 {now()}"]))
+        await event.answer("▶️ سنایپر روشن شد." if ok else "ناموفق.")
+    await tg_account_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgdel_(\\d+)"))
+async def tg_delete_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    await _tg_stop_tabchi(phone)
+    await _tg_stop_secretary_one(phone)
+    await _tg_stop_sniper_one(phone)
+    await tg.drop_client(phone)
+    db.tg_delete_account(phone)
+    await event.answer("حذف شد.")
+    await tg_menu_cb(event)
+
+
+# ----- tabchi text config -----
+@bot.on(events.CallbackQuery(data=b"tgtext"))
+async def tg_text_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_tabchi_text"}
+    await safe_edit(event,
+        f"📝 متنِ تبچی رو بفرست (هر بار یکی؛ الان {len(db.tg_list_texts('tabchi'))} تا داری).",
+        buttons=[[Button.inline("🗑 پاک‌کردن همه", b"tgtextclr")],
+                 [Button.inline("🔙 بازگشت", b"tg")]])
+
+
+async def handle_tg_tabchi_text(event):
+    state.pop(event.sender_id, None)
+    txt = event.raw_text.strip()
+    if not txt:
+        await event.respond("متن خالیه.", buttons=_tg_menu_buttons())
+        return
+    db.tg_add_text(txt, "tabchi")
+    await event.respond(f"✅ اضافه شد (کل: {len(db.tg_list_texts('tabchi'))}).",
+                        buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgtextclr"))
+async def tg_textclr_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_clear_texts("tabchi")
+    await safe_edit(event, "🗑 متن‌های تبچی پاک شد.", buttons=_tg_menu_buttons())
+
+
+# ----- mutual-send content config (text OR media + caption) -----
+@bot.on(events.CallbackQuery(data=b"tgmcontent"))
+async def tg_mcontent_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_mutual_content"}
+    await safe_edit(event,
+        "📦 محتوای ارسال به دوطرفه‌ها رو بفرست:\n"
+        "• فقط متن ⇐ همون متن می‌فرسته.\n"
+        "• عکس/ویس/فایل (با کپشن اختیاری) ⇐ همون فایل با کپشن می‌فرسته.",
+        buttons=[[Button.inline("🔙 بازگشت", b"tg")]])
+
+
+async def handle_tg_mutual_content(event):
+    state.pop(event.sender_id, None)
+    caption = (event.raw_text or "").strip()
+    if event.media:
+        os.makedirs(TG_MEDIA_DIR, exist_ok=True)
+        try:
+            path = await event.download_media(
+                file=os.path.join(TG_MEDIA_DIR, f"c_{int(time.time())}"))
+        except Exception as e:  # noqa: BLE001
+            await event.respond(f"❌ دانلودِ فایل ناموفق: {repr(e)[:120]}")
+            return
+        db.tg_set_mutual_content(text="", media=path, caption=caption)
+        await event.respond(f"✅ محتوا (فایل+کپشن) ذخیره شد.\nکپشن: {caption[:60] or '—'}",
+                            buttons=_tg_menu_buttons())
+    else:
+        if not caption:
+            await event.respond("چیزی نفرستادی. متن یا فایل بفرست.")
+            return
+        db.tg_set_mutual_content(text=caption, media="", caption="")
+        await event.respond("✅ محتوا (متن) ذخیره شد.", buttons=_tg_menu_buttons())
+
+
+# ----- speed (0.2 .. 1.0) -----
+@bot.on(events.CallbackQuery(data=b"tgtext2"))
+async def tg_text2_cb(event):
+    if not is_owner(event):
+        return
+    cur = db.tg_get_mutual_content().get("text2", "")
+    state[event.sender_id] = {"step": "await_tg_text2"}
+    await safe_edit(event,
+        "✍️ متنِ دومِ ارسال رو بفرست (بعد از محتوای اول، این هم به همون مخاطب فرستاده می‌شه).\n"
+        f"الان: {('«'+cur[:60]+'»') if cur else '—'}\n"
+        "برای پاک‌کردنِ متنِ دوم، فقط یه نقطه (.) بفرست.",
+        buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
+
+
+async def handle_tg_text2(event):
+    state.pop(event.sender_id, None)
+    txt = (event.raw_text or "").strip()
+    if txt == ".":
+        db.tg_set_mutual_text2("")
+        await event.respond("🗑 متنِ دوم پاک شد.", buttons=_tg_menu_buttons())
+        return
+    if not txt:
+        await event.respond("متن خالیه.", buttons=_tg_menu_buttons())
+        return
+    db.tg_set_mutual_text2(txt)
+    await event.respond("✅ متنِ دوم ذخیره شد. (موقعِ ارسال بعد از محتوای اول فرستاده می‌شه.)",
+                        buttons=_tg_menu_buttons())
+
+
+
+async def tg_speed_cb(event):
+    if not is_owner(event):
+        return
+    cur = db.tg_get_send_delay()
+    await safe_edit(event, f"⏱ سرعتِ ارسالِ تلگرام (۰.۲ تا ۱ ثانیه). الان: {cur}s",
+        buttons=[[Button.inline("0.2s", b"tgspd_0.2"), Button.inline("0.4s", b"tgspd_0.4"),
+                  Button.inline("0.6s", b"tgspd_0.6")],
+                 [Button.inline("0.8s", b"tgspd_0.8"), Button.inline("1s", b"tgspd_1")],
+                 [Button.inline("🔙 بازگشت", b"tg")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgspd_(.+)"))
+async def tg_speed_set_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_set_send_delay(event.pattern_match.group(1).decode())
+    await event.answer(f"⏱ روی {db.tg_get_send_delay()}s تنظیم شد.")
+    await tg_speed_cb(event)
+
+
+# ----- tabchi interval -----
+@bot.on(events.CallbackQuery(data=b"tgint"))
+async def tg_int_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_interval"}
+    await safe_edit(event,
+        f"🕒 فاصلهٔ هر دورِ تبچی (ثانیه) رو بفرست. الان: {db.tg_get_tabchi_interval()}s",
+        buttons=[[Button.inline("🔙 بازگشت", b"tg")]])
+
+
+async def handle_tg_interval(event):
+    state.pop(event.sender_id, None)
+    db.tg_set_tabchi_interval(event.raw_text.strip())
+    await event.respond(f"✅ فاصلهٔ تبچی روی {db.tg_get_tabchi_interval()}s تنظیم شد.",
+                        buttons=_tg_menu_buttons())
+
+
+async def handle_tg_speed(event):
+    state.pop(event.sender_id, None)
+    db.tg_set_send_delay(event.raw_text.strip())
+    await event.respond(f"✅ سرعت روی {db.tg_get_send_delay()}s تنظیم شد.",
+                        buttons=_tg_menu_buttons())
+
+
+# --------------------------------------------------------------------------- #
+# Mutual-contact send (live progress + stop/pause/resume + dedup)
+# --------------------------------------------------------------------------- #
+def _tg_ctl_buttons(phone: str):
+    paused = [[Button.inline("▶️ ادامه", f"tgresume_{phone}".encode()),
+               Button.inline("⏹ توقف", f"tgstop_{phone}".encode())]]
+    running = [[Button.inline("⏸ مکث", f"tgpause_{phone}".encode()),
+                Button.inline("⏹ توقف", f"tgstop_{phone}".encode())]]
+    return paused, running
+
+
+def _tg_mutual_card(ctl) -> str:
+    total = ctl.get("total", 0)
+    done = ctl.get("done", 0)
+    pct = int(done * 100 / total) if total else 0
+    status = "⏸ مکث" if ctl.get("pause") else ("⏹ در حال توقف" if ctl.get("stop")
+                                                else "🟢 در حال ارسال")
+    return card("✈️ ارسال به مخاطبین — زنده (اول دوطرفه‌ها)", [
+        f"📱 {ctl.get('phone', '')}",
+        f"وضعیت : {status}",
+        f"📊 {done} از {total} — {pct}%",
+        f"✅ موفق : {ctl.get('ok', 0)}   ❌ ناموفق : {ctl.get('fail', 0)}   "
+        f"⏭ تکراری : {ctl.get('skip', 0)}",
+        f"🕒 {now()}",
+    ])
+
+
+async def _tg_mutual_progress_loop(phone, ctl, msg):
+    while not ctl.get("finished"):
+        paused, running = _tg_ctl_buttons(phone)
+        try:
+            await safe_edit(msg, _tg_mutual_card(ctl),
+                            buttons=paused if ctl.get("pause") else running)
+        except Exception:
+            pass
+        await asyncio.sleep(max(1.0, config.TG_STATS_REFRESH))
+
+
+async def _tg_run_mutual(owner_id, acc):
+    phone = acc["phone"]
+    content = db.tg_get_mutual_content()
+    text2 = content.get("text2", "")
+    if not content.get("text") and not content.get("media") and not text2:
+        await bot.send_message(owner_id, "اول «📦 محتوای ارسال» یا «✍️ متن دوم» رو تنظیم کن.")
+        return
+    delay = db.tg_get_send_delay()
+    await log(card("✈️ TG MUTUAL SEND START", [
+        f"📱 {phone}", f"⏱ سرعت : {delay}s",
+        f"📦 {'فایل+کپشن' if content.get('media') else 'متن'}", f"🕒 {now()}"]))
+    try:
+        client = await tg.get_client(phone)
+    except Exception as e:  # noqa: BLE001
+        db.tg_set_status(phone, "inactive")
+        await log(card("✈️ TG MUTUAL — سشن مشکل دارد", [f"📱 {phone}", f"💥 {repr(e)[:120]}"]))
+        await bot.send_message(owner_id, f"🔴 اکانت {phone} لاگین لازم داره ({repr(e)[:80]}).")
+        return
+    try:
+        targets, mutual_count = await tg.get_contacts_ordered(client)
+    except Exception as e:  # noqa: BLE001
+        await bot.send_message(owner_id, f"❌ گرفتنِ مخاطبین ناموفق: {repr(e)[:120]}")
+        return
+    await log(card("✈️ TG SEND — ترتیب", [
+        f"📱 {phone}", f"🤝 دوطرفه‌ها (اول) : {mutual_count}",
+        f"👥 بقیهٔ مخاطبین (بعد) : {len(targets) - mutual_count}",
+        f"📊 کل : {len(targets)}"]))
+    ctl = {"stop": False, "pause": False, "ok": 0, "fail": 0, "skip": 0,
+           "total": len(targets), "done": 0, "phone": phone, "finished": False,
+           "mutuals": mutual_count}
+    tg_jobs[phone] = ctl
+    _, running = _tg_ctl_buttons(phone)
+    try:
+        msg = await bot.send_message(owner_id, _tg_mutual_card(ctl), buttons=running)
+    except Exception:
+        msg = None
+    prog = asyncio.create_task(_tg_mutual_progress_loop(phone, ctl, msg)) if msg else None
+    # Upload the media ONCE to Saved Messages, then forward it to everyone
+    # (no per-recipient re-upload — much faster). Text-only content is sent
+    # directly since text has no upload cost.
+    saved_media = None
+    if content.get("media"):
+        try:
+            saved_media = await tg.upload_to_saved(client, content["media"],
+                                                   content.get("caption", ""))
+            await log(card("✈️ TG SEND — فایل تو Saved آپلود شد", [
+                f"📱 {phone}", "بقیه بدونِ برچسبِ فوروارد و بدونِ آپلودِ دوباره کپی می‌شه.",
+                f"🕒 {now()}"]))
+        except Exception as e:  # noqa: BLE001
+            saved_media = None
+            await log(card("✈️ TG SEND — آپلودِ فایل ناموفق", [
+                f"📱 {phone}", f"💥 {repr(e)[:120]}"]))
+    for u in targets:
+        if await _ctl_gate(ctl):
+            break
+        uid = getattr(u, "id", None)
+        if db.tg_was_sent(uid):
+            ctl["skip"] += 1
+            ctl["done"] += 1
+            continue
+        try:
+            if saved_media is not None:
+                await tg.send_saved_media(client, u, saved_media,
+                                          content.get("caption", ""))   # copy, no fwd tag
+                db.tg_incr_sent(phone, 1)
+            elif content.get("text"):
+                await tg.send_text(client, u, content.get("text", ""),
+                                   typing=_tg_typing_secs())
+                db.tg_incr_sent(phone, 1)
+            if text2:
+                await tg.send_text(client, u, text2, typing=_tg_typing_secs())
+                db.tg_incr_sent(phone, 1)
+            ctl["ok"] += 1
+            db.tg_mark_sent(uid)
+        except Exception:
+            ctl["fail"] += 1
+        ctl["done"] += 1
+        await asyncio.sleep(max(0.0, float(delay)))
+    ctl["finished"] = True
+    if prog:
+        prog.cancel()
+    tg_jobs.pop(phone, None)
+    attempted = ctl["ok"] + ctl["fail"]
+    pct = int(ctl["ok"] * 100 / attempted) if attempted else 0
+    await log(card("✈️ TG MUTUAL SEND — پایان", [
+        f"📱 {phone}",
+        f"✅ {ctl['ok']}   ❌ {ctl['fail']}   ⏭ تکراری {ctl['skip']}",
+        f"📈 نرخ موفقیت : {pct}%", f"🕒 {now()}"]))
+    if msg:
+        try:
+            await safe_edit(msg, _tg_mutual_card(ctl),
+                            buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
+        except Exception:
+            pass
+    await bot.send_message(owner_id,
+        f"✈️ ارسال تموم شد. ✅ {ctl['ok']} / ❌ {ctl['fail']} — نرخ {pct}%",
+        buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
+
+
+@bot.on(events.CallbackQuery(data=b"tgmutual"))
+async def tg_mutual_cb(event):
+    if not is_owner(event):
+        return
+    accs = [a for a in db.tg_list_accounts() if a["status"] == "active"]
+    if not accs:
+        await event.answer("اکانتِ فعالِ تلگرام نداری.", alert=True)
+        return
+    rows = [[Button.inline(f"📤 {a['phone']} (👥{a['contacts']})",
+                           f"tgmut_{a['rid']}".encode())] for a in accs]
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event,
+        "📤 ارسال به مخاطبینِ دوطرفه — یک اکانت انتخاب کن.\n"
+        "(اول دوطرفه‌ها، بعد بقیهٔ مخاطبین. ضدتکرارِ سراسری فعاله.)", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgmut_(\\d+)"))
+async def tg_mutual_pick_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    if acc["phone"] in tg_jobs:
+        await event.answer("یه ارسال روی این اکانت همین الان در جریانه.", alert=True)
+        return
+    await safe_edit(event, f"📤 ارسال به مخاطبینِ {acc['phone']} شروع شد (اول دوطرفه‌ها). گزارش تو گپ لاگ میاد.",
+                    buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
+    asyncio.create_task(_tg_run_mutual(event.sender_id, acc))
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgstop_(.+)"))
+async def tg_stop_cb(event):
+    if not is_owner(event):
+        return
+    ctl = tg_jobs.get(event.pattern_match.group(1).decode())
+    if not ctl:
+        await event.answer("کاری در جریان نیست.", alert=True)
+        return
+    ctl["stop"] = True
+    ctl["pause"] = False
+    await event.answer("⏹ توقف ثبت شد.")
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgpause_(.+)"))
+async def tg_pause_cb(event):
+    if not is_owner(event):
+        return
+    ctl = tg_jobs.get(event.pattern_match.group(1).decode())
+    if not ctl:
+        await event.answer("کاری در جریان نیست.", alert=True)
+        return
+    ctl["pause"] = True
+    await event.answer("⏸ مکث شد.")
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgresume_(.+)"))
+async def tg_resume_cb(event):
+    if not is_owner(event):
+        return
+    ctl = tg_jobs.get(event.pattern_match.group(1).decode())
+    if not ctl:
+        await event.answer("کاری در جریان نیست.", alert=True)
+        return
+    ctl["pause"] = False
+    await event.answer("▶️ ادامه یافت.")
+
+
+# --------------------------------------------------------------------------- #
+# Tabchi (group posting) — MULTIPLE accounts concurrently + pinned live stats.
+# --------------------------------------------------------------------------- #
+def _tg_stats_card() -> str:
+    rows = []
+    tot_sent = tot_rep = tot_groups = 0
+    for phone, t in list(tg_tabchi_tasks.items()):
+        acc = db.tg_get_account(phone)
+        st = t.get("state", {})
+        sent = st.get("sent", 0)
+        groups = st.get("groups", 0)
+        rep = int(acc.get("replied_total", 0) or 0) if acc else 0
+        pv = tg_pv_counts.get(phone, 0)
+        tot_sent += sent
+        tot_rep += rep
+        tot_groups += groups
+        rows.append(f"📱 {phone} — 👥{groups} گروه | ✉️{sent} ارسال | 📥{pv} پیوی | ↩️{rep} جواب")
+    rows.append(LINE)
+    rows.append(f"📊 جمع — 👥{tot_groups} گروه | ✉️{tot_sent} ارسال | ↩️{tot_rep} جواب")
+    rows.append(f"🟢 تبچیِ روشن : {len(tg_tabchi_tasks)}")
+    rows.append(f"🕒 {now()}")
+    return card("📌 ✈️ تبچی تلگرام — آمارِ زنده", rows)
+
+
+async def _tg_stats_loop():
+    """Keep the pinned stats card fresh while any tabchi is running."""
+    while tg_tabchi_tasks:
+        msg = tg_stats.get("msg")
+        if msg is not None:
+            try:
+                await safe_edit(msg, _tg_stats_card())
+            except Exception:
+                pass
+        await asyncio.sleep(max(2.0, config.TG_STATS_REFRESH))
+    tg_stats["task"] = None
+
+
+async def _tg_ensure_stats_card():
+    """Create + pin the live stats card once, and start its refresh loop."""
+    if tg_stats.get("msg") is None:
+        try:
+            m = await bot.send_message(config.LOG_GROUP_ID, _tg_stats_card())
+            tg_stats["msg"] = m
+            try:
+                await bot.pin_message(config.LOG_GROUP_ID, m, notify=False)
+            except Exception:
+                pass
+        except Exception:
+            tg_stats["msg"] = None
+    if not tg_stats.get("task") or tg_stats["task"].done():
+        tg_stats["task"] = asyncio.create_task(_tg_stats_loop())
+
+
+async def _tg_run_tabchi(phone, st):
+    """One account's tabchi loop: post the configured texts into ALL groups the
+    account is in, every interval, with human typing. Reads texts fresh each
+    pass so edits take effect live."""
+    last_idx = None
+    try:
+        while not st.get("stop"):
+            texts = db.tg_list_texts("tabchi")
+            interval = db.tg_get_tabchi_interval()
+            delay = db.tg_get_send_delay()
+            if texts:
+                try:
+                    client = await tg.get_client(phone)
+                    groups = await tg.get_group_entities(client)
+                    st["groups"] = len(groups)
+                    for g in groups:
+                        if st.get("stop"):
+                            break
+                        idx, txt = _pick_text(texts, last_idx)
+                        if txt is None:
+                            break
+                        try:
+                            await tg.send_text(client, g, txt, typing=_tg_typing_secs())
+                            st["sent"] = st.get("sent", 0) + 1
+                            last_idx = idx
+                            db.tg_incr_sent(phone, 1)
+                        except Exception:
+                            # likely forced-membership / write-forbidden: try to
+                            # bypass (join the required sponsor channel) and retry.
+                            try:
+                                if await _tg_handle_forced(client, g):
+                                    await tg.send_text(client, g, txt, typing=0.0)
+                                    st["sent"] = st.get("sent", 0) + 1
+                                    last_idx = idx
+                                    db.tg_incr_sent(phone, 1)
+                                    await log(card("✈️ TG تبچی — عضویتِ اجباری دور زده شد", [
+                                        f"📱 {phone}", f"🕒 {now()}"]))
+                            except Exception:
+                                pass
+                        await asyncio.sleep(max(0.0, float(delay)))
+                except Exception as e:  # noqa: BLE001
+                    await tg.drop_client(phone)
+                    await log(f"⚠️ تبچی تلگرام «{phone}» خطا (ادامه): {repr(e)[:120]}")
+            waited = 0
+            while waited < interval and not st.get("stop"):
+                await asyncio.sleep(1)
+                waited += 1
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ تبچی تلگرام «{phone}» متوقف شد: {repr(e)[:140]}")
+
+
+@bot.on(events.CallbackQuery(data=b"tgtabchi"))
+async def tg_tabchi_cb(event):
+    if not is_owner(event):
+        return
+    accs = [a for a in db.tg_list_accounts() if a["status"] == "active"]
+    if not accs:
+        await event.answer("اکانتِ فعالِ تلگرام نداری.", alert=True)
+        return
+    if not db.tg_list_texts("tabchi"):
+        await event.answer("اول «📝 متن تبچی» تنظیم کن.", alert=True)
+        return
+    rows = []
+    for a in accs:
+        on = a["phone"] in tg_tabchi_tasks
+        rows.append([Button.inline(f"{'🟢 روشن' if on else '⚪️ خاموش'} — {a['phone']}",
+                                   f"tgtab_{a['rid']}".encode())])
+    rows.append([Button.inline("⏹ توقفِ همه", b"tgtaballoff")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event,
+        "🔁 تبچی تلگرام — روی هر اکانت بزن تا روشن/خاموش شه.\n"
+        "می‌تونی چندتا اکانت رو همزمان روشن کنی.", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgtab_(\\d+)"))
+async def tg_tabchi_toggle_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    if phone in tg_tabchi_tasks:
+        await _tg_stop_tabchi(phone)
+        await event.answer("⏹ تبچیِ این اکانت خاموش شد.")
+        await tg_tabchi_cb(event)
+        return
+    # start: report group count first, then launch the concurrent loop
+    try:
+        client = await tg.get_client(phone)
+        groups = await tg.get_group_entities(client)
+    except Exception as e:  # noqa: BLE001
+        await event.answer(f"اتصال ناموفق: {repr(e)[:80]}", alert=True)
+        return
+    stt = {"stop": False, "sent": 0, "groups": len(groups), "pv": 0}
+    task = asyncio.create_task(_tg_run_tabchi(phone, stt))
+    tg_tabchi_tasks[phone] = {"task": task, "state": stt}
+    await log(card("✈️ TG تبچی — استارت", [
+        f"📱 {phone}", f"👥 گروه‌ها : {len(groups)}",
+        f"📝 متن‌ها : {len(db.tg_list_texts('tabchi'))}",
+        f"🕒 {now()}"]))
+    await _tg_ensure_stats_card()
+    await event.answer(f"🟢 تبچی روشن شد — {len(groups)} گروه.")
+    await tg_tabchi_cb(event)
+
+
+async def _tg_stop_tabchi(phone):
+    t = tg_tabchi_tasks.pop(phone, None)
+    if t:
+        t["state"]["stop"] = True
+        task = t.get("task")
+        if task and not task.done():
+            task.cancel()
+        await log(card("✈️ TG تبچی — توقف", [f"📱 {phone}",
+                       f"✉️ ارسالی این دور: {t['state'].get('sent', 0)}", f"🕒 {now()}"]))
+
+
+@bot.on(events.CallbackQuery(data=b"tgtaballoff"))
+async def tg_tabchi_alloff_cb(event):
+    if not is_owner(event):
+        return
+    for phone in list(tg_tabchi_tasks.keys()):
+        await _tg_stop_tabchi(phone)
+    await event.answer("⏹ همهٔ تبچی‌ها خاموش شدن.")
+    await tg_tabchi_cb(event)
+
+
+# =========================================================================== #
+# ✈️ TELEGRAM phases 3-6: join engine, comment engine, lead sniper, secretary.
+# =========================================================================== #
+def _tg_active_accounts() -> list:
+    return [a for a in db.tg_list_accounts() if a.get("status") == "active"]
+
+
+async def _tg_harvest_links(reader, channels) -> list:
+    phone = reader["phone"]
+    client = await tg.get_client(phone)
+    links, seen = [], set()
+    for ch in channels:
+        try:
+            ent = await client.get_entity(ch["ref"])
+        except Exception:
+            continue
+        for m in await tg.get_recent_messages(client, ent, config.TG_CHANNEL_SCAN):
+            for lk in tg.extract_tg_links(getattr(m, "message", "") or ""):
+                if lk not in seen:
+                    seen.add(lk)
+                    links.append(lk)
+    return links
+
+
+async def _tg_handle_forced(client, entity) -> bool:
+    """Heuristic 'must join @X to write': scan recent messages for t.me links
+    and join them, so the account can post afterwards."""
+    joined = False
+    try:
+        for m in await tg.get_recent_messages(client, entity, 15):
+            for lk in tg.extract_tg_links(getattr(m, "message", "") or ""):
+                try:
+                    await tg.join_link(client, lk)
+                    joined = True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return joined
+
+
+async def _tg_join_one(acc, link):
+    phone = acc["phone"]
+    try:
+        client = await tg.get_client(phone)
+        ent = await tg.join_link(client, link)
+        gid = getattr(ent, "id", None)
+        title = getattr(ent, "title", "") or ""
+        if gid:
+            db.tg_add_group(gid, link, phone, title)
+        try:
+            await tg.ensure_can_write(client, ent)      # forced-membership (API)
+        except Exception:
+            await _tg_handle_forced(client, ent)         # forced-membership (bot)
+        await log(card("✈️ TG JOIN ✅", [f"📱 {phone}", f"👥 {title or gid}",
+                                         f"🔗 {link}", f"🕒 {now()}"]))
+    except Exception as e:  # noqa: BLE001
+        await log(card("✈️ TG JOIN ❌", [f"📱 {phone}", f"🔗 {link}",
+                                         f"💥 {repr(e)[:120]}", f"🕒 {now()}"]))
+
+
+async def _tg_join_engine_loop():
+    eng = tg_join_engine
+    while not eng["stop"]:
+        accounts = _tg_active_accounts()
+        channels = db.tg_list_link_channels()
+        if not accounts or not channels:
+            await log(card("✈️ TG JOIN — متوقف", ["اکانت یا کانالِ منبع نیست."]))
+            break
+        try:
+            links = await _tg_harvest_links(accounts[0], channels)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ TG harvest خطا: {repr(e)[:120]}")
+            links = []
+        new = [lk for lk in links if db.tg_seen_link(lk)]   # marks + keeps NEW
+        if not new:
+            await log(card("✈️ TG JOIN — لینکِ جدیدی نیست", [
+                f"⏳ {config.TG_COMMENT_INTERVAL}s بعد دوباره چک می‌کنم.", f"🕒 {now()}"]))
+            waited = 0
+            while waited < config.TG_COMMENT_INTERVAL and not eng["stop"]:
+                await asyncio.sleep(2)
+                waited += 2
+            continue
+        await log(card("✈️ TG JOIN — دورِ جدید", [
+            f"🔗 لینکِ جدید : {len(new)}", f"👥 اکانت‌ها : {len(accounts)}",
+            f"📦 هر دسته : {config.TG_JOIN_BATCH}", f"🕒 {now()}"]))
+        for i in range(0, len(new), config.TG_JOIN_BATCH):
+            if eng["stop"]:
+                break
+            batch = new[i:i + config.TG_JOIN_BATCH]
+            # round-robin across accounts, concurrently
+            tasks = [_tg_join_one(accounts[j % len(accounts)], lk)
+                     for j, lk in enumerate(batch)]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(config.TG_JOIN_DELAY)
+    eng["task"] = None
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoin"))
+async def tg_join_cb(event):
+    if not is_owner(event):
+        return
+    running = tg_join_engine.get("task") is not None and not tg_join_engine["stop"]
+    chans = db.tg_list_link_channels()
+    rows = [[Button.inline("➕ افزودن کانالِ منبع (لینکدونی/تبچی)", b"tgjoinadd")],
+            [Button.inline(f"🗑 پاک‌کردن منابع ({len(chans)})", b"tgjoinclr")]]
+    if running:
+        rows.append([Button.inline("⏹ توقفِ موتورِ جوین", b"tgjoinstop")])
+    else:
+        rows.append([Button.inline("▶️ شروعِ موتورِ جوین", b"tgjoinstart")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, card("🔗 موتورِ جوینِ گروهِ تلگرام", [
+        f"📋 کانال‌های منبع : {len(chans)}",
+        f"وضعیت : {'🟢 روشن' if running else '🔴 خاموش'}",
+        f"📦 هر بار {config.TG_JOIN_BATCH} گروهِ جدید، چنداکانتِ همزمان، ضدتکرار.",
+        "عضویتِ اجباری هم خودکار هندل می‌شه."]), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoinadd"))
+async def tg_joinadd_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_link_channels"}
+    await safe_edit(event, "📋 لینک/آیدیِ کانال‌های منبع رو بفرست (هر خط یا با فاصله).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"tgjoin")]])
+
+
+async def handle_tg_link_channels(event):
+    state.pop(event.sender_id, None)
+    refs = [p for p in _re_u.split(r"[\s,]+", event.raw_text.strip()) if p.strip()]
+    added = sum(1 for r in refs if db.tg_add_link_channel(r))
+    await event.respond(f"✅ {added} کانالِ منبع اضافه شد "
+                        f"(کل: {len(db.tg_list_link_channels())}).",
+                        buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoinclr"))
+async def tg_joinclr_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_clear_link_channels()
+    await tg_join_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoinstart"))
+async def tg_joinstart_cb(event):
+    if not is_owner(event):
+        return
+    if not _tg_active_accounts():
+        await event.answer("اکانتِ فعالِ تلگرام نداری.", alert=True)
+        return
+    if not db.tg_list_link_channels():
+        await event.answer("اول کانالِ منبع اضافه کن.", alert=True)
+        return
+    tg_join_engine["stop"] = False
+    tg_join_engine["task"] = asyncio.create_task(_tg_join_engine_loop())
+    await event.answer("▶️ موتورِ جوین روشن شد.")
+    await tg_join_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgjoinstop"))
+async def tg_joinstop_cb(event):
+    if not is_owner(event):
+        return
+    tg_join_engine["stop"] = True
+    await event.answer("⏹ موتورِ جوین خاموش شد.")
+    await tg_join_cb(event)
+
+
+# --------------------------------------------------------------------------- #
+# Comment engine
+# --------------------------------------------------------------------------- #
+async def _tg_comment_engine_loop():
+    eng = tg_comment_engine
+    idx = 0
+    while not eng["stop"]:
+        accounts = _tg_active_accounts()
+        channels = db.tg_list_link_channels()
+        texts = db.tg_list_comment_texts()
+        if not accounts or not channels or not texts:
+            await log(card("✈️ TG COMMENT — متوقف", ["اکانت/کانال/متنِ کامنت ناقصه."]))
+            break
+        last = None
+        for ch in channels:
+            if eng["stop"]:
+                break
+            acc = accounts[idx % len(accounts)]
+            idx += 1
+            try:
+                client = await tg.get_client(acc["phone"])
+                ent = await client.get_entity(ch["ref"])
+                disc = await tg.get_linked_discussion(client, ent)
+                if disc is None:
+                    continue        # channel has comments disabled
+                post_ids = await tg.get_recent_post_ids(client, ent, config.TG_COMMENT_SCAN)
+                for pid in post_ids:
+                    if eng["stop"]:
+                        break
+                    i, txt = _pick_text(texts, last)
+                    last = i
+                    try:
+                        await tg.comment_to_post(client, ent, pid, txt,
+                                                 typing=_tg_typing_secs())
+                        db.tg_incr_sent(acc["phone"], 1)
+                        await log(card("✈️ TG COMMENT ✅", [
+                            f"📱 {acc['phone']}", f"📢 {ch['ref']}", f"📝 post {pid}",
+                            f"🕒 {now()}"]))
+                    except Exception as e:  # noqa: BLE001
+                        await log(card("✈️ TG COMMENT ❌", [
+                            f"📱 {acc['phone']}", f"📢 {ch['ref']}",
+                            f"💥 {repr(e)[:110]}"]))
+                    await asyncio.sleep(db.tg_get_send_delay())
+            except Exception as e:  # noqa: BLE001
+                await log(f"⚠️ کامنت‌انجین خطا ({ch['ref']}): {repr(e)[:110]}")
+        waited = 0
+        while waited < config.TG_COMMENT_INTERVAL and not eng["stop"]:
+            await asyncio.sleep(2)
+            waited += 2
+    eng["task"] = None
+
+
+@bot.on(events.CallbackQuery(data=b"tgcomment"))
+async def tg_comment_cb(event):
+    if not is_owner(event):
+        return
+    running = tg_comment_engine.get("task") is not None and not tg_comment_engine["stop"]
+    rows = [[Button.inline("✍️ افزودن متنِ کامنت", b"tgcadd"),
+             Button.inline("🗑 پاک‌کردن", b"tgcclr")]]
+    if running:
+        rows.append([Button.inline("⏹ توقفِ کامنت‌انجین", b"tgcstop")])
+    else:
+        rows.append([Button.inline("▶️ شروعِ کامنت‌انجین", b"tgcstart")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, card("💬 کامنت‌انجین تلگرام", [
+        f"📝 متن‌های کامنت : {len(db.tg_list_comment_texts())}",
+        f"📋 کانال‌های منبع : {len(db.tg_list_link_channels())} (مشترک با موتورِ جوین)",
+        f"وضعیت : {'🟢 روشن' if running else '🔴 خاموش'}",
+        "کانال‌های کامنت‌دار رو خودش با linked_chat تشخیص می‌ده و زیرِ پست‌ها کامنت می‌ذاره."]),
+        buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"tgcadd"))
+async def tg_cadd_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_comment_text"}
+    await safe_edit(event, "✍️ متنِ کامنت رو بفرست (هر بار یکی).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"tgcomment")]])
+
+
+async def handle_tg_comment_text(event):
+    state.pop(event.sender_id, None)
+    txt = event.raw_text.strip()
+    if not txt:
+        await event.respond("متن خالیه.", buttons=_tg_menu_buttons())
+        return
+    db.tg_add_comment_text(txt)
+    await event.respond(f"✅ اضافه شد (کل: {len(db.tg_list_comment_texts())}).",
+                        buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgcclr"))
+async def tg_cclr_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_clear_comment_texts()
+    await tg_comment_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgcstart"))
+async def tg_cstart_cb(event):
+    if not is_owner(event):
+        return
+    if not db.tg_list_comment_texts() or not db.tg_list_link_channels():
+        await event.answer("اول متنِ کامنت و کانالِ منبع تنظیم کن.", alert=True)
+        return
+    tg_comment_engine["stop"] = False
+    tg_comment_engine["task"] = asyncio.create_task(_tg_comment_engine_loop())
+    await event.answer("▶️ کامنت‌انجین روشن شد.")
+    await tg_comment_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgcstop"))
+async def tg_cstop_cb(event):
+    if not is_owner(event):
+        return
+    tg_comment_engine["stop"] = True
+    await event.answer("⏹ کامنت‌انجین خاموش شد.")
+    await tg_comment_cb(event)
+
+
+# --------------------------------------------------------------------------- #
+# Lead Sniper — keyword monitor across the groups the accounts are in.
+# --------------------------------------------------------------------------- #
+def _make_sniper_handler(phone: str):
+    async def _handler(event):
+        try:
+            if not event.is_group:
+                return
+            text = event.raw_text or ""
+            if not text:
+                return
+            low = text.lower()
+            hit = next((k for k in db.tg_list_keywords() if k.lower() in low), None)
+            if not hit:
+                return
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                sender = None
+            uid = getattr(sender, "id", None) or event.sender_id
+            uname = getattr(sender, "username", "") or "—"
+            try:
+                chat = await event.get_chat()
+                title = getattr(chat, "title", "") or ""
+            except Exception:
+                title = ""
+            await log(card("🎯 LEAD SNIPER", [
+                f"🔑 کلیدواژه : {hit}",
+                f"🆔 {uid}   👤 @{uname}",
+                f"📍 گروه : {title}",
+                f"💬 {text[:600]}",
+                f"📱 اکانت : {phone}",
+                f"🕒 {now()}"]))
+        except Exception:
+            pass
+    return _handler
+
+
+async def _tg_start_sniper():
+    for acc in _tg_active_accounts():
+        phone = acc["phone"]
+        if phone in tg_sniper["handlers"]:
+            continue
+        try:
+            client = await tg.get_client(phone)
+            h = _make_sniper_handler(phone)
+            client.add_event_handler(h, events.NewMessage(incoming=True))
+            tg_sniper["handlers"][phone] = (client, h)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ لیدسنایپر {phone} وصل نشد: {repr(e)[:100]}")
+    tg_sniper["on"] = True
+
+
+async def _tg_stop_sniper():
+    for phone, (client, h) in list(tg_sniper["handlers"].items()):
+        try:
+            client.remove_event_handler(h)
+        except Exception:
+            pass
+    tg_sniper["handlers"].clear()
+    tg_sniper["on"] = False
+
+
+async def _tg_start_sniper_one(phone: str) -> bool:
+    if phone in tg_sniper["handlers"]:
+        return True
+    try:
+        client = await tg.get_client(phone)
+        h = _make_sniper_handler(phone)
+        client.add_event_handler(h, events.NewMessage(incoming=True))
+        tg_sniper["handlers"][phone] = (client, h)
+        return True
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ سنایپر {phone} وصل نشد: {repr(e)[:100]}")
+        return False
+
+
+async def _tg_stop_sniper_one(phone: str):
+    t = tg_sniper["handlers"].pop(phone, None)
+    if t:
+        try:
+            t[0].remove_event_handler(t[1])
+        except Exception:
+            pass
+
+
+@bot.on(events.CallbackQuery(data=b"tgsniper"))
+async def tg_sniper_cb(event):
+    if not is_owner(event):
+        return
+    rows = [[Button.inline("➕ افزودن کلیدواژه", b"tgkwadd"),
+             Button.inline("🗑 پاک‌کردن", b"tgkwclr")]]
+    if tg_sniper["on"]:
+        rows.append([Button.inline("⏹ خاموش‌کردنِ لیدسنایپر", b"tgsnipoff")])
+    else:
+        rows.append([Button.inline("▶️ روشن‌کردنِ لیدسنایپر", b"tgsnipon")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, card("🎯 لیدسنایپر تلگرام", [
+        f"🔑 کلیدواژه‌ها : {', '.join(db.tg_list_keywords()) or '—'}",
+        f"وضعیت : {'🟢 روشن' if tg_sniper['on'] else '🔴 خاموش'}",
+        "هر پیامِ گروه که شاملِ کلیدواژه باشه، آیدی+یوزرنیم+متنِ کامل به گپ لاگ میاد."]),
+        buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"tgkwadd"))
+async def tg_kwadd_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_keyword"}
+    await safe_edit(event, "🔑 کلیدواژه‌ها رو بفرست (هر خط یا با فاصله/کاما).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"tgsniper")]])
+
+
+async def handle_tg_keyword(event):
+    state.pop(event.sender_id, None)
+    words = [w for w in _re_u.split(r"[\s,]+", event.raw_text.strip()) if w.strip()]
+    for w in words:
+        db.tg_add_keyword(w)
+    await event.respond(f"✅ کلیدواژه‌ها ذخیره شد: {', '.join(db.tg_list_keywords())}",
+                        buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgkwclr"))
+async def tg_kwclr_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_clear_keywords()
+    await tg_sniper_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgsnipon"))
+async def tg_snipon_cb(event):
+    if not is_owner(event):
+        return
+    if not db.tg_list_keywords():
+        await event.answer("اول کلیدواژه اضافه کن.", alert=True)
+        return
+    await _tg_start_sniper()
+    await log(card("🎯 LEAD SNIPER — روشن", [
+        f"🔑 {', '.join(db.tg_list_keywords())}", f"👥 اکانت‌ها : {len(tg_sniper['handlers'])}",
+        f"🕒 {now()}"]))
+    await event.answer("▶️ لیدسنایپر روشن شد.")
+    await tg_sniper_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgsnipoff"))
+async def tg_snipoff_cb(event):
+    if not is_owner(event):
+        return
+    await _tg_stop_sniper()
+    await log(card("🎯 LEAD SNIPER — خاموش", [f"🕒 {now()}"]))
+    await event.answer("⏹ خاموش شد.")
+    await tg_sniper_cb(event)
+
+
+# --------------------------------------------------------------------------- #
+# Secretary — auto-reply to incoming PVs (text or media+caption).
+# --------------------------------------------------------------------------- #
+def _make_secretary_handler(phone: str):
+    async def _handler(event):
+        try:
+            if not event.is_private:
+                return
+            try:
+                sender = await event.get_sender()
+                if getattr(sender, "bot", False):
+                    return
+            except Exception:
+                sender = None
+            uid = getattr(sender, "id", None) or event.sender_id
+            tg_pv_counts[phone] = tg_pv_counts.get(phone, 0) + 1
+            seen = tg_secretary["seen"].setdefault(phone, set())
+            if uid in seen:
+                return                       # reply ONCE per user
+            content = db.tg_get_secretary_content()
+            if not content.get("text") and not content.get("media"):
+                return
+            await tg.send_content(event.client, event.chat_id, content.get("text", ""),
+                                  content.get("media", ""), content.get("caption", ""),
+                                  typing=_tg_typing_secs())
+            seen.add(uid)
+            db.tg_incr_replied(phone, 1)
+            await log(card("🤖 منشی تلگرام — جواب داد", [
+                f"📱 {phone}", f"🆔 {uid}", f"🕒 {now()}"]))
+        except Exception:
+            pass
+    return _handler
+
+
+async def _tg_start_secretary():
+    for acc in _tg_active_accounts():
+        phone = acc["phone"]
+        if phone in tg_secretary["handlers"]:
+            continue
+        try:
+            client = await tg.get_client(phone)
+            h = _make_secretary_handler(phone)
+            client.add_event_handler(h, events.NewMessage(incoming=True))
+            tg_secretary["handlers"][phone] = (client, h)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ منشی {phone} وصل نشد: {repr(e)[:100]}")
+    tg_secretary["on"] = True
+
+
+async def _tg_stop_secretary():
+    for phone, (client, h) in list(tg_secretary["handlers"].items()):
+        try:
+            client.remove_event_handler(h)
+        except Exception:
+            pass
+    tg_secretary["handlers"].clear()
+    tg_secretary["on"] = False
+
+
+async def _tg_start_secretary_one(phone: str) -> bool:
+    if phone in tg_secretary["handlers"]:
+        return True
+    try:
+        client = await tg.get_client(phone)
+        h = _make_secretary_handler(phone)
+        client.add_event_handler(h, events.NewMessage(incoming=True))
+        tg_secretary["handlers"][phone] = (client, h)
+        return True
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ منشی {phone} وصل نشد: {repr(e)[:100]}")
+        return False
+
+
+async def _tg_stop_secretary_one(phone: str):
+    t = tg_secretary["handlers"].pop(phone, None)
+    if t:
+        try:
+            t[0].remove_event_handler(t[1])
+        except Exception:
+            pass
+
+
+@bot.on(events.CallbackQuery(data=b"tgsecretary"))
+async def tg_secretary_cb(event):
+    if not is_owner(event):
+        return
+    cont = db.tg_get_secretary_content()
+    rows = [[Button.inline("📦 تنظیمِ پاسخِ منشی", b"tgsecset")]]
+    if tg_secretary["on"]:
+        rows.append([Button.inline("⏹ خاموش‌کردنِ منشی", b"tgsecoff")])
+    else:
+        rows.append([Button.inline("▶️ روشن‌کردنِ منشی", b"tgsecon")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, card("🤖 منشیِ تلگرام", [
+        f"📦 پاسخ : "
+        + ("🖼 فایل+کپشن" if cont.get("media") else ("✍️ متن" if cont.get("text") else "—")),
+        f"وضعیت : {'🟢 روشن' if tg_secretary['on'] else '🔴 خاموش'}",
+        "به هرکی تو پیوی پیام بده، یک‌بار پاسخِ تنظیم‌شده می‌فرسته."]), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"tgsecset"))
+async def tg_secset_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_secretary_content"}
+    await safe_edit(event, "📦 پاسخِ منشی رو بفرست (متن، یا عکس/ویس/فایل با کپشن).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"tgsecretary")]])
+
+
+async def handle_tg_secretary_content(event):
+    state.pop(event.sender_id, None)
+    caption = (event.raw_text or "").strip()
+    if event.media:
+        os.makedirs(TG_MEDIA_DIR, exist_ok=True)
+        try:
+            path = await event.download_media(
+                file=os.path.join(TG_MEDIA_DIR, f"sec_{int(time.time())}"))
+        except Exception as e:  # noqa: BLE001
+            await event.respond(f"❌ دانلود ناموفق: {repr(e)[:110]}")
+            return
+        db.tg_set_secretary_content(text="", media=path, caption=caption)
+        await event.respond("✅ پاسخِ منشی (فایل+کپشن) ذخیره شد.", buttons=_tg_menu_buttons())
+    else:
+        if not caption:
+            await event.respond("چیزی نفرستادی.")
+            return
+        db.tg_set_secretary_content(text=caption, media="", caption="")
+        await event.respond("✅ پاسخِ منشی (متن) ذخیره شد.", buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgsecon"))
+async def tg_secon_cb(event):
+    if not is_owner(event):
+        return
+    cont = db.tg_get_secretary_content()
+    if not cont.get("text") and not cont.get("media"):
+        await event.answer("اول پاسخِ منشی رو تنظیم کن.", alert=True)
+        return
+    await _tg_start_secretary()
+    await log(card("🤖 منشی تلگرام — روشن", [
+        f"👥 اکانت‌ها : {len(tg_secretary['handlers'])}", f"🕒 {now()}"]))
+    await event.answer("▶️ منشی روشن شد.")
+    await tg_secretary_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"tgsecoff"))
+async def tg_secoff_cb(event):
+    if not is_owner(event):
+        return
+    await _tg_stop_secretary()
+    await log(card("🤖 منشی تلگرام — خاموش", [f"🕒 {now()}"]))
+    await event.answer("⏹ خاموش شد.")
+    await tg_secretary_cb(event)
+
+
 # --------------------------------------------------------------------------- #
 # Boot
 # --------------------------------------------------------------------------- #
@@ -4150,7 +5695,11 @@ async def amain():
     # health & self-heal engine (verify sessions, relaunch stalled automation,
     # post overall health card) — موتور سلامت و خودتعمیر
     asyncio.create_task(health_engine_loop())
+    # Item 3: linkdooni engine — periodic stats card + relaunch if it was
+    # enabled before the restart.
+    asyncio.create_task(linkdooni_summary_loop())
     await recover_extras()
+    await recover_linkdooni()
     try:
         await bot.run_until_disconnected()
     finally:
@@ -4480,11 +6029,14 @@ async def contacts_menu_cb(event):
     rows = [[Button.inline(f"📇 {a['phone']}", f"cadd_{a['id']}".encode())]
             for a in accounts]
     rows.append([Button.inline(f"⏱ سرعت فعلی: {db.get_contact_delay()}s", b"cspeed")])
+    rows.append([Button.inline("🔎 کشف دوست با پیش‌شماره", b"discover")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     await safe_edit(event,
         "➕ افزودن مخاطب با فایل txt\n"
         f"{LINE}\nیک اکانت انتخاب کن، بعد فایل شماره‌ها رو بفرست.\n"
-        "هر خط: یک شماره (اختیاری: «شماره,اسم»).", buttons=rows)
+        "هر خط: یک شماره (اختیاری: «شماره,اسم»).\n"
+        "یا «🔎 کشف دوست با پیش‌شماره» رو بزن تا ربات خودش شماره‌های روبیکادار پیدا کنه.",
+        buttons=rows)
 
 
 @bot.on(events.CallbackQuery(data=b"cspeed"))
@@ -4542,7 +6094,19 @@ async def handle_contacts_file(event, st):
     asyncio.create_task(run_contact_import(event.sender_id, acc, pairs))
 
 
-async def _contacts_add_local(phone, pairs, delay, log_every, tag=""):
+async def _ctl_gate(ctl) -> bool:
+    """Honor an optional live control dict (Item 1/2). Returns True if the job
+    must STOP. Blocks here while it is PAUSED. ``ctl`` may be None."""
+    if not ctl:
+        return False
+    if ctl.get("stop"):
+        return True
+    while ctl.get("pause") and not ctl.get("stop"):
+        await asyncio.sleep(0.5)
+    return bool(ctl.get("stop"))
+
+
+async def _contacts_add_local(phone, pairs, delay, log_every, tag="", ctl=None):
     async def _do(client):
         added = 0        # on Rubika (real contact)
         not_user = 0     # added to address book but no Rubika account
@@ -4550,6 +6114,8 @@ async def _contacts_add_local(phone, pairs, delay, log_every, tag=""):
         attempt_fail = 0
         guids = []
         for ph, name in pairs:
+            if await _ctl_gate(ctl):          # live stop/pause (Item 1)
+                break
             try:
                 r = await asyncio.wait_for(
                     rb.add_contact(client, ph, name or config.CONTACT_DEFAULT_FIRST),
@@ -4571,6 +6137,11 @@ async def _contacts_add_local(phone, pairs, delay, log_every, tag=""):
                         f"🕒 {now()}"]))
                     await asyncio.sleep(db.get_resume_wait())
                     attempt_fail = 0
+            if ctl is not None:               # feed the live progress card
+                ctl["added"] = added
+                ctl["not_user"] = not_user
+                ctl["failed"] = failed
+                ctl["done"] = added + not_user + failed
             if log_every > 0 and (added + not_user + failed) % log_every == 0:
                 await log(card("📇 افزودن مخاطب — پیشرفت", [
                     f"{tag}📱 {phone}",
@@ -4582,55 +6153,653 @@ async def _contacts_add_local(phone, pairs, delay, log_every, tag=""):
     return await account_conn.call(phone, _do, timeout=14400)
 
 
-async def _contacts_add(acc, pairs, delay, tag=""):
+async def _contacts_add(acc, pairs, delay, tag="", ctl=None):
     """Add contacts on local OR remote account. Returns dict with
-    added (on Rubika) / not_user / failed / guids."""
+    added (on Rubika) / not_user / failed / guids.
+
+    When ``ctl`` is given (Item 1 live progress), the REMOTE path is driven in
+    chunks so pause/stop stay responsive and the progress card updates between
+    chunks instead of waiting for the whole list to finish on the worker."""
     phone = acc["phone"]
     w = worker.worker_for_account(acc)
     if w and not worker.is_local(w):
-        res = await worker.api_call(w, "POST", "/contacts/add", {
-            "phone": phone, "numbers": [p for p, _n in pairs],
-            "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
-        }, timeout=14400)
-        if not res.get("ok"):
-            raise RuntimeError(res.get("error", "contacts add failed"))
-        return {"added": res.get("added", 0), "not_user": res.get("not_user", 0),
-                "failed": res.get("failed", 0), "guids": res.get("guids", [])}
-    return await _contacts_add_local(phone, pairs, delay, config.CONTACT_LOG_EVERY, tag)
+        if ctl is None:
+            res = await worker.api_call(w, "POST", "/contacts/add", {
+                "phone": phone, "numbers": [p for p, _n in pairs],
+                "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
+            }, timeout=14400)
+            if not res.get("ok"):
+                raise RuntimeError(res.get("error", "contacts add failed"))
+            return {"added": res.get("added", 0), "not_user": res.get("not_user", 0),
+                    "failed": res.get("failed", 0), "guids": res.get("guids", [])}
+        # chunked remote add with live control
+        added = not_user = failed = 0
+        guids = []
+        chunk = max(1, config.CONTACT_REMOTE_CHUNK)
+        for i in range(0, len(pairs), chunk):
+            if await _ctl_gate(ctl):
+                break
+            part = pairs[i:i + chunk]
+            res = await worker.api_call(w, "POST", "/contacts/add", {
+                "phone": phone, "numbers": [p for p, _n in part],
+                "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
+            }, timeout=14400)
+            if not res.get("ok"):
+                raise RuntimeError(res.get("error", "contacts add failed"))
+            added += res.get("added", 0)
+            not_user += res.get("not_user", 0)
+            failed += res.get("failed", 0)
+            guids.extend(res.get("guids", []) or [])
+            ctl["added"] = added
+            ctl["not_user"] = not_user
+            ctl["failed"] = failed
+            ctl["done"] = added + not_user + failed
+        return {"added": added, "not_user": not_user, "failed": failed, "guids": guids}
+    return await _contacts_add_local(phone, pairs, delay, config.CONTACT_LOG_EVERY,
+                                     tag, ctl=ctl)
+
+
+def _ctl_buttons(aid: int, kind: str = "c"):
+    """Stop/pause/resume buttons for a live job. kind 'c' = contact import,
+    'd' = discovery (so the two never clash)."""
+    paused_row = [Button.inline("▶️ ادامه", f"{kind}resume_{aid}".encode()),
+                  Button.inline("⏹ توقف", f"{kind}stop_{aid}".encode())]
+    running_row = [Button.inline("⏸ مکث", f"{kind}pause_{aid}".encode()),
+                   Button.inline("⏹ توقف", f"{kind}stop_{aid}".encode())]
+    return [paused_row], [running_row]
+
+
+def _contact_progress_card(ctl) -> str:
+    total = ctl.get("total", 0)
+    done = ctl.get("done", 0)
+    pct = int(done * 100 / total) if total else 0
+    status = "⏸ مکث" if ctl.get("pause") else ("⏹ در حال توقف" if ctl.get("stop")
+                                                else "🟢 در حال اجرا")
+    return card("📇 افزودن مخاطب — پیشرفت زنده", [
+        f"📱 {ctl.get('phone', '')}",
+        f"وضعیت : {status}",
+        f"📊 {done} از {total} — {pct}%",
+        f"🟢 روبیکادار : {ctl.get('added', 0)}   "
+        f"📵 بدون‌روبیکا : {ctl.get('not_user', 0)}   ❌ {ctl.get('failed', 0)}",
+        f"🕒 {now()}",
+    ])
+
+
+async def _contact_progress_loop(owner_id: int, aid: int, ctl: dict, msg):
+    """Edit the live progress message every CONTACT_PROGRESS_EVERY seconds until
+    the job is marked finished."""
+    while not ctl.get("finished"):
+        paused_btns, running_btns = _ctl_buttons(aid, "c")
+        try:
+            await safe_edit(msg, _contact_progress_card(ctl),
+                            buttons=paused_btns if ctl.get("pause") else running_btns)
+        except Exception:
+            pass
+        await asyncio.sleep(max(1.0, config.CONTACT_PROGRESS_EVERY))
 
 
 async def run_contact_import(owner_id: int, acc, pairs):
     phone = acc["phone"]
+    aid = acc["id"]
     delay = db.get_contact_delay()
+    ctl = {"stop": False, "pause": False, "added": 0, "not_user": 0,
+           "failed": 0, "total": len(pairs), "done": 0, "phone": phone,
+           "finished": False}
+    contact_jobs[aid] = ctl
     await log(card("📇 CONTACT IMPORT START", [
         f"📱 {phone}", f"🎯 شماره‌ها : {len(pairs)}", f"⏱ سرعت : {delay}s", f"🕒 {now()}"]))
+    _, running_btns = _ctl_buttons(aid, "c")
     try:
-        res = await _contacts_add(acc, pairs, delay)
+        msg = await bot.send_message(owner_id, _contact_progress_card(ctl),
+                                     buttons=running_btns)
+    except Exception:
+        msg = None
+    prog_task = None
+    if msg is not None:
+        prog_task = asyncio.create_task(_contact_progress_loop(owner_id, aid, ctl, msg))
+    try:
+        res = await _contacts_add(acc, pairs, delay, ctl=ctl)
     except account_conn.InvalidAuthError:
-        db.set_status(acc["id"], "inactive")
+        db.set_status(aid, "inactive")
+        ctl["finished"] = True
+        contact_jobs.pop(aid, None)
+        if prog_task:
+            prog_task.cancel()
         await log(card("📇 CONTACT IMPORT — سشن باطل", [f"📱 {phone}", f"🕒 {now()}"]))
         await bot.send_message(owner_id, f"🔴 سشن {phone} باطله. دوباره اضافه‌اش کن.")
         return
     except Exception as e:  # noqa: BLE001
+        ctl["finished"] = True
+        contact_jobs.pop(aid, None)
+        if prog_task:
+            prog_task.cancel()
         await log(card("📇 CONTACT IMPORT — خطا", [
             f"📱 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
         await bot.send_message(owner_id, f"❌ افزودن مخاطب ناموفق: {repr(e)[:120]}")
         return
+    ctl["finished"] = True
+    if prog_task:
+        prog_task.cancel()
+    stopped = ctl.get("stop")
+    contact_jobs.pop(aid, None)
     added = res.get("added", 0)
     not_user = res.get("not_user", 0)
     failed = res.get("failed", 0)
-    await log(card("📇 CONTACT IMPORT FINISHED ✅", [
+    title = "📇 CONTACT IMPORT STOPPED ⏹" if stopped else "📇 CONTACT IMPORT FINISHED ✅"
+    await log(card(title, [
         f"📱 {phone}",
         f"🟢 روی روبیکا اضافه شد : {added}",
         f"📵 روبیکا نداشت : {not_user}",
         f"❌ ناموفق : {failed}",
         f"📦 کل : {len(pairs)}",
         f"🕒 {now()}"]))
+    if msg is not None:
+        try:
+            await safe_edit(msg, _contact_progress_card(ctl),
+                            buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+        except Exception:
+            pass
     await bot.send_message(owner_id,
-        f"✅ {added} مخاطبِ روبیکادار به اکانت {phone} اضافه شد.\n"
-        f"📵 بدون روبیکا: {not_user}   ❌ ناموفق: {failed}\n"
-        "(فقط شماره‌هایی که روبیکا دارن به‌عنوان مخاطب نشون داده می‌شن.)",
+        ("⏹ افزودن مخاطب متوقف شد. " if stopped else "✅ افزودن مخاطب تمام شد. ")
+        + f"\n🟢 روبیکادار: {added}   📵 بدون روبیکا: {not_user}   ❌ ناموفق: {failed}",
         buttons=main_menu(owner_id == config.OWNER_ID))
+
+
+# ---- Item 1: live contact-import controls (stop / pause / resume) ----
+@bot.on(events.CallbackQuery(pattern=b"cstop_(\\d+)"))
+async def contact_stop_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    ctl = contact_jobs.get(aid)
+    if not ctl:
+        await event.answer("کاری برای توقف نیست.", alert=True)
+        return
+    ctl["stop"] = True
+    ctl["pause"] = False
+    await event.answer("⏹ توقف ثبت شد. بعد از مخاطب جاری متوقف می‌شود.", alert=True)
+
+
+@bot.on(events.CallbackQuery(pattern=b"cpause_(\\d+)"))
+async def contact_pause_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    ctl = contact_jobs.get(aid)
+    if not ctl:
+        await event.answer("کاری برای مکث نیست.", alert=True)
+        return
+    ctl["pause"] = True
+    await event.answer("⏸ مکث شد.")
+
+
+@bot.on(events.CallbackQuery(pattern=b"cresume_(\\d+)"))
+async def contact_resume_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    ctl = contact_jobs.get(aid)
+    if not ctl:
+        await event.answer("کاری برای ادامه نیست.", alert=True)
+        return
+    ctl["pause"] = False
+    await event.answer("▶️ ادامه یافت.")
+
+
+# --------------------------------------------------------------------------- #
+# Item 2: prefix-based contact-discovery engine (موتور کشف دوست با پیش‌شماره)
+# Used by BOTH «➕ افزودن مخاطب» (single account) and «🧠 مغز» (the selected
+# fleet). The user gives a prefix of ANY length (e.g. 0913 or 09135646); the
+# bot fills the rest of the 11 digits at random, probes them via add_contact
+# until DISCOVERY_TARGET (150) Rubika-having numbers are found, keeps a simple
+# anti-repeat ledger (leeched_numbers), then feeds the found guids straight into
+# the send pipeline in either 'marker' or 'text' mode.
+# --------------------------------------------------------------------------- #
+def _clean_prefix(raw: str):
+    """Normalise a user-supplied prefix into a 0-leading mobile prefix (<=11)."""
+    digits = _re_u.sub(r"\D", "", raw or "")
+    if not digits:
+        return None
+    if digits.startswith("98"):
+        digits = "0" + digits[2:]
+    if not digits.startswith("0"):
+        digits = "0" + digits
+    return digits[:11]
+
+
+def _gen_number(prefix: str) -> str:
+    need = 11 - len(prefix)
+    suffix = "".join(random.choice("0123456789") for _ in range(max(0, need)))
+    return prefix + suffix
+
+
+def _next_candidate(prefix: str, session_seen: set):
+    """Return (display_number, normalized) that is NOT already leeched/seen."""
+    for _ in range(300):
+        num = _gen_number(prefix)
+        norm = rb.normalize_phone(num)
+        if not norm or norm in session_seen:
+            continue
+        session_seen.add(norm)
+        if db.was_leeched(norm):
+            continue
+        return num, norm
+    return None, None
+
+
+def _discovery_card(ctl) -> str:
+    status = "⏸ مکث" if ctl.get("pause") else ("⏹ در حال توقف" if ctl.get("stop")
+                                                else "🟢 در حال جستجو")
+    target = ctl.get("target", 0)
+    found = ctl.get("found", 0)
+    pct = int(found * 100 / target) if target else 0
+    return card("🔎 کشف دوست با پیش‌شماره — زنده", [
+        f"📱 {ctl.get('phone', '')}",
+        f"☎️ پیش‌شماره : {ctl.get('prefix', '')}",
+        f"وضعیت : {status}",
+        f"🎯 پیداشده : {found} از {target} — {pct}%",
+        f"🔍 پروب‌شده : {ctl.get('probed', 0)}",
+        f"🕒 {now()}",
+    ])
+
+
+async def _discovery_progress_loop(aid: int, ctl: dict, msg):
+    while not ctl.get("finished"):
+        paused_btns, running_btns = _ctl_buttons(aid, "c")  # reuse contact controls
+        try:
+            await safe_edit(msg, _discovery_card(ctl),
+                            buttons=paused_btns if ctl.get("pause") else running_btns)
+        except Exception:
+            pass
+        await asyncio.sleep(max(1.0, config.CONTACT_PROGRESS_EVERY))
+
+
+async def _discover_for_account(acc, prefix, target, ctl, tag=""):
+    """Probe random numbers built from `prefix` until `target` Rubika-having
+    guids are found (or attempts/stop). Returns the list of found guids."""
+    phone = acc["phone"]
+    delay = db.get_discovery_delay()
+    max_attempts = config.DISCOVERY_MAX_ATTEMPTS
+    session_seen: set = set()
+    w = worker.worker_for_account(acc)
+
+    if w and not worker.is_local(w):
+        # remote: probe in chunks via the existing /contacts/add endpoint.
+        found = []
+        probed = 0
+        chunk = max(1, config.CONTACT_REMOTE_CHUNK)
+        while len(found) < target and probed < max_attempts:
+            if await _ctl_gate(ctl):
+                break
+            nums = []
+            for _ in range(chunk):
+                disp, norm = _next_candidate(prefix, session_seen)
+                if not disp:
+                    break
+                nums.append((disp, norm))
+            if not nums:
+                break
+            res = await worker.api_call(w, "POST", "/contacts/add", {
+                "phone": phone, "numbers": [d for d, _n in nums],
+                "delay": delay, "default_first": config.CONTACT_DEFAULT_FIRST,
+            }, timeout=7200)
+            if not res.get("ok"):
+                raise RuntimeError(res.get("error", "discovery probe failed"))
+            probed += len(nums)
+            for _d, norm in nums:
+                db.mark_leeched(norm, False)
+            for g in (res.get("guids", []) or []):
+                if g not in found:
+                    found.append(g)
+            ctl["found"] = len(found)
+            ctl["probed"] = probed
+        return found[:target]
+
+    # local: probe one-by-one so the ledger + live counter are exact.
+    async def _do(client):
+        found = []
+        probed = 0
+        attempt_fail = 0
+        while len(found) < target and probed < max_attempts:
+            if await _ctl_gate(ctl):
+                break
+            disp, norm = _next_candidate(prefix, session_seen)
+            if not disp:
+                break
+            probed += 1
+            try:
+                r = await asyncio.wait_for(
+                    rb.add_contact(client, disp, config.CONTACT_DEFAULT_FIRST),
+                    timeout=config.SEND_TIMEOUT)
+                attempt_fail = 0
+                on_r = bool(r.get("on_rubika"))
+                db.mark_leeched(norm, on_r)
+                if on_r and r.get("guid") and r["guid"] not in found:
+                    found.append(r["guid"])
+            except Exception:
+                attempt_fail += 1
+                if attempt_fail >= db.get_max_errors():
+                    await log(card("🔎 کشف دوست — وقفه", [
+                        f"{tag}📱 {phone}",
+                        f"{db.get_max_errors()} خطای پشت‌سرهم → صبر {db.get_resume_wait()}s",
+                        f"🕒 {now()}"]))
+                    await asyncio.sleep(db.get_resume_wait())
+                    attempt_fail = 0
+            ctl["found"] = len(found)
+            ctl["probed"] = probed
+            await asyncio.sleep(max(0.0, float(delay)))
+        return found[:target]
+
+    return await account_conn.call(phone, _do, timeout=86400)
+
+
+async def _send_to_guids(owner_id, acc, guids, mode, text, tag=""):
+    """Send to a fixed list of guids in 'marker' or 'text' mode. Returns
+    (ok, fail). Reuses run_send locally; uses /send/to_list remotely."""
+    if not guids:
+        return 0, 0
+    phone = acc["phone"]
+    aid = acc["id"]
+    delay = db.get_delay()
+    marker = db.get_marker()
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/send/to_list", {
+            "phone": phone, "marker": marker, "guids": guids, "delay": delay,
+            "max_errors": db.get_max_errors(), "send_timeout": config.SEND_TIMEOUT,
+            "mode": mode, "text": text}, timeout=14400)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error", "send failed"))
+        return res.get("sent", 0), res.get("fail", 0)
+    # local
+    saved_guid = mid = None
+    if mode != "text":
+        saved_guid, mid = await _find_marker_local(phone, marker)
+        if not mid:
+            await log(card("🔎 کشف — مارکر پیدا نشد", [f"{tag}📱 {phone}"]))
+            return 0, 0
+    r = await run_send(owner_id, {
+        "account_id": aid, "phone": phone, "saved_guid": saved_guid, "mid": mid,
+        "recipients": guids, "tag": tag, "suppress_resume_panel": True,
+        "mode": mode, "text": text})
+    return (r or {}).get("ok", 0), (r or {}).get("fail", 0)
+
+
+async def _run_discovery(owner_id, accounts, prefix, mode, text):
+    """Discover DISCOVERY_TARGET rubika-having numbers per account, then send to
+    them in the chosen mode, and report the success rate."""
+    target = config.DISCOVERY_TARGET
+    _mode_label = ("بدون ارسال (فقط ساخت مخاطب)" if mode == "none"
+                   else ("متن دلخواه" if mode == "text" else "مارکر"))
+    for i, a in enumerate(accounts, 1):
+        a["_tag"] = f"#A{i}" if len(accounts) > 1 else ""
+    await log(card("🔎 DISCOVERY START", [
+        f"☎️ پیش‌شماره : {prefix}",
+        f"👥 اکانت‌ها : {len(accounts)}",
+        f"🎯 هدف هر اکانت : {target} روبیکادار",
+        f"✍️ حالت : {_mode_label}",
+        f"🕒 {now()}"]))
+    grand_ok = grand_fail = grand_found = 0
+    for acc in accounts:
+        aid = acc["id"]
+        phone = acc["phone"]
+        tag = (acc.get("_tag") or "")
+        ltag = (tag + " ") if tag else ""
+        ctl = {"stop": False, "pause": False, "found": 0, "probed": 0,
+               "target": target, "phone": phone, "prefix": prefix,
+               "finished": False}
+        contact_jobs[aid] = ctl
+        _, running_btns = _ctl_buttons(aid, "c")
+        try:
+            msg = await bot.send_message(owner_id, _discovery_card(ctl),
+                                         buttons=running_btns)
+        except Exception:
+            msg = None
+        prog = asyncio.create_task(_discovery_progress_loop(aid, ctl, msg)) if msg else None
+        try:
+            guids = await _discover_for_account(acc, prefix, target, ctl, tag=ltag)
+        except account_conn.InvalidAuthError:
+            db.set_status(aid, "inactive")
+            ctl["finished"] = True
+            if prog:
+                prog.cancel()
+            contact_jobs.pop(aid, None)
+            await log(card("🔎 کشف — سشن باطل", [f"{ltag}📱 {phone}", f"🕒 {now()}"]))
+            continue
+        except Exception as e:  # noqa: BLE001
+            ctl["finished"] = True
+            if prog:
+                prog.cancel()
+            contact_jobs.pop(aid, None)
+            await log(card("🔎 کشف — خطا", [
+                f"{ltag}📱 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
+            continue
+        ctl["finished"] = True
+        if prog:
+            prog.cancel()
+        contact_jobs.pop(aid, None)
+        grand_found += len(guids)
+        await log(card("🔎 کشف — پایان اکانت", [
+            f"{ltag}📱 {phone}",
+            f"🎯 پیداشده : {len(guids)} روبیکادار",
+            f"🔍 پروب‌شده : {ctl.get('probed', 0)}",
+            f"🕒 {now()}"]))
+        if not guids:
+            continue
+        if mode == "none":
+            continue        # «بدون ارسال»: فقط مخاطب ساخته شد، چیزی فرستاده نمی‌شه
+        # straight into the send pipeline (Item 2 wiring) — with a STOP button
+        stop_flags[aid] = False
+        try:
+            await bot.send_message(owner_id,
+                f"📤 ارسال به {len(guids)} مخاطبِ ساخته‌شدهٔ {phone} شروع شد.",
+                buttons=[[Button.inline("⏹ توقفِ ارسال", f"stop_{aid}".encode())]])
+        except Exception:
+            pass
+        try:
+            ok, fail = await _send_to_guids(owner_id, acc, guids, mode, text, tag=ltag)
+            grand_ok += ok
+            grand_fail += fail
+        except account_conn.InvalidAuthError:
+            db.set_status(aid, "inactive")
+            await log(card("🔎 ارسال — سشن باطل", [f"{ltag}📱 {phone}"]))
+        except Exception as e:  # noqa: BLE001
+            await log(card("🔎 ارسال — خطا", [f"{ltag}📱 {phone}", f"💥 {repr(e)[:140]}"]))
+    attempted = grand_ok + grand_fail
+    pct = int(grand_ok * 100 / attempted) if attempted else 0
+    if mode == "none":
+        await log(card("🏁 DISCOVERY — پایان (بدون ارسال)", [
+            f"🎯 مجموع پیداشده/ساخته‌شده : {grand_found} مخاطب روبیکادار",
+            "📵 طبق انتخابت چیزی ارسال نشد.",
+            f"🕒 {now()}"]))
+        try:
+            await bot.send_message(owner_id, card("🔎 کشف دوست تمام شد ✅ (بدون ارسال)", [
+                f"🎯 پیداشده : {grand_found} مخاطب روبیکادار",
+                "📵 ارسالی انجام نشد — مخاطب‌ها ساخته شدن، هر وقت خواستی از بخش ارسال بفرست."]),
+                buttons=main_menu(owner_id == config.OWNER_ID))
+        except Exception:
+            pass
+        return
+    await log(card("🏁 DISCOVERY — پایان", [
+        f"🎯 مجموع پیداشده : {grand_found} روبیکادار",
+        f"✅ ارسال موفق : {grand_ok}   ❌ ناموفق : {grand_fail}",
+        f"📈 نرخ موفقیت : {pct}%",
+        f"🕒 {now()}"]))
+    try:
+        await bot.send_message(owner_id, card("🔎 کشف دوست تمام شد ✅", [
+            f"🎯 پیداشده : {grand_found} روبیکادار",
+            f"✅ ارسال موفق : {grand_ok}   ❌ ناموفق : {grand_fail}",
+            f"📈 نرخ موفقیت : {pct}%"]),
+            buttons=main_menu(owner_id == config.OWNER_ID))
+    except Exception:
+        pass
+
+
+def _discovery_mode_buttons():
+    return [[Button.inline("📌 ارسال مارکر", b"dmode_marker"),
+             Button.inline("✍️ متن دلخواه", b"dmode_text")],
+            [Button.inline("📵 بدون ارسال (فقط بساز)", b"dmode_none")],
+            [Button.inline("🔙 لغو", b"home")]]
+
+
+# ----- entry from «➕ افزودن مخاطب»: pick ONE account, then prefix -----
+@bot.on(events.CallbackQuery(data=b"discover"))
+async def discover_menu_cb(event):
+    if not is_owner(event):
+        return
+    accounts = db.list_accounts()
+    if not accounts:
+        await event.answer("اول یک اکانت اضافه کن.", alert=True)
+        return
+    rows = [[Button.inline(f"🔎 {a['phone']}", f"dpick_{a['id']}".encode())]
+            for a in accounts]
+    spd = db.get_discovery_delay()
+    rows.append([Button.inline(f"⏱ سرعت پروب: {spd}s", b"dspd_show")])
+    rows.append([Button.inline("0.2s", b"dspd_0.2"),
+                 Button.inline("0.5s", b"dspd_0.5"),
+                 Button.inline("1s", b"dspd_1"),
+                 Button.inline("2s", b"dspd_2")])
+    rows.append([Button.inline("🔙 بازگشت", b"contacts")])
+    await safe_edit(event,
+        "🔎 کشف دوست با پیش‌شماره\n"
+        f"{LINE}\nیک اکانت انتخاب کن، بعد پیش‌شماره رو بفرست.\n"
+        f"ربات تا پیدا کردن {config.DISCOVERY_TARGET} شماره‌ی روبیکادار ادامه می‌ده.\n"
+        f"⏱ سرعتِ پروب الان: {spd} ثانیه (هرچی کمتر = سریع‌تر ولی پرریسک‌تر).",
+        buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"dspd_(.+)"))
+async def discover_speed_cb(event):
+    if not is_owner(event):
+        return
+    val = event.pattern_match.group(1).decode()
+    if val == "show":
+        await event.answer(f"سرعت پروب فعلی: {db.get_discovery_delay()}s — یکی از پریست‌ها رو بزن.",
+                           alert=True)
+        return
+    db.set_discovery_delay(val)
+    await event.answer(f"⏱ سرعت پروب روی {db.get_discovery_delay()}s تنظیم شد.")
+    await discover_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"dpick_(\\d+)"))
+async def discover_pick_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    state[event.sender_id] = {"step": "await_discover_prefix", "ids": [aid]}
+    await safe_edit(event,
+        f"☎️ پیش‌شماره رو برای اکانت {acc['phone']} بفرست.\n"
+        "مثال: `0913` یا `09135646` (هر طولی — بقیه رندوم پر می‌شه).",
+        buttons=[[Button.inline("🔙 لغو", b"contacts")]])
+
+
+@bot.on(events.CallbackQuery(data=b"bdiscover"))
+async def brain_discover_cb(event):
+    """Entry from «🧠 مغز»: discover for the whole selected fleet."""
+    if not is_owner(event):
+        return
+    sel = list(brain_sel.get(event.sender_id, set()))
+    if not sel:
+        await event.answer("اول حداقل یک اکانت انتخاب کن.", alert=True)
+        return
+    state[event.sender_id] = {"step": "await_discover_prefix", "ids": sel}
+    await safe_edit(event,
+        f"☎️ پیش‌شماره رو بفرست. هر کدوم از {len(sel)} اکانت تا "
+        f"{config.DISCOVERY_TARGET} شماره‌ی روبیکادار پیدا و ارسال می‌کنه.\n"
+        "مثال: `0913` یا `09135646`.",
+        buttons=[[Button.inline("🔙 لغو", b"brain")]])
+
+
+async def handle_discover_prefix(event, st):
+    prefix = _clean_prefix(event.raw_text.strip())
+    if not prefix or len(prefix) < 2 or len(prefix) > 11:
+        await event.respond("پیش‌شماره نامعتبره. یه چیزی مثل `0913` بفرست.")
+        return
+    if len(prefix) == 11:
+        await event.respond("این یه شماره‌ی کامله، نه پیش‌شماره. یه پیش‌شماره‌ی کوتاه‌تر بده.")
+        return
+    st["prefix"] = prefix
+    st["step"] = "await_discover_mode"
+    await event.respond(
+        f"☎️ پیش‌شماره: `{prefix}`\nحالا حالت ارسال به شماره‌های پیداشده رو انتخاب کن:",
+        buttons=_discovery_mode_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"dmode_marker"))
+async def discover_mode_marker_cb(event):
+    if not is_owner(event):
+        return
+    st = state.get(event.sender_id) or {}
+    if st.get("step") != "await_discover_mode":
+        await event.answer("منقضی شده. دوباره شروع کن.", alert=True)
+        return
+    ids = st.get("ids") or []
+    prefix = st.get("prefix")
+    state.pop(event.sender_id, None)
+    accounts = [a for a in (db.get_account(i) for i in ids) if a]
+    if not accounts or not prefix:
+        await event.answer("اطلاعات ناقصه.", alert=True)
+        return
+    await safe_edit(event, "🔎 کشف دوست شروع شد (حالت: مارکر). گزارش‌ها تو گروه لاگ میاد.",
+                    buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+    asyncio.create_task(_run_discovery(event.sender_id, accounts, prefix, "marker", ""))
+
+
+@bot.on(events.CallbackQuery(data=b"dmode_none"))
+async def discover_mode_none_cb(event):
+    """Discover only — find the rubika-having numbers but DO NOT send anything."""
+    if not is_owner(event):
+        return
+    st = state.get(event.sender_id) or {}
+    if st.get("step") != "await_discover_mode":
+        await event.answer("منقضی شده. دوباره شروع کن.", alert=True)
+        return
+    ids = st.get("ids") or []
+    prefix = st.get("prefix")
+    state.pop(event.sender_id, None)
+    accounts = [a for a in (db.get_account(i) for i in ids) if a]
+    if not accounts or not prefix:
+        await event.answer("اطلاعات ناقصه.", alert=True)
+        return
+    await safe_edit(event, "🔎 کشف دوست شروع شد (بدون ارسال — فقط ساختِ مخاطب). گزارش تو گروه لاگ میاد.",
+                    buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+    asyncio.create_task(_run_discovery(event.sender_id, accounts, prefix, "none", ""))
+
+
+@bot.on(events.CallbackQuery(data=b"dmode_text"))
+async def discover_mode_text_cb(event):
+    if not is_owner(event):
+        return
+    st = state.get(event.sender_id) or {}
+    if st.get("step") != "await_discover_mode":
+        await event.answer("منقضی شده. دوباره شروع کن.", alert=True)
+        return
+    st["step"] = "await_discover_text"
+    await safe_edit(event, "✍️ متنی که می‌خوای به شماره‌های پیداشده فرستاده بشه رو بفرست:",
+                    buttons=[[Button.inline("🔙 لغو", b"home")]])
+
+
+async def handle_discover_text(event, st):
+    text = event.raw_text.strip()
+    if not text:
+        await event.respond("متن نمی‌تونه خالی باشه. دوباره بفرست.")
+        return
+    ids = st.get("ids") or []
+    prefix = st.get("prefix")
+    state.pop(event.sender_id, None)
+    accounts = [a for a in (db.get_account(i) for i in ids) if a]
+    if not accounts or not prefix:
+        await event.respond("اطلاعات ناقصه. دوباره شروع کن.",
+                            buttons=main_menu(is_real_owner(event)))
+        return
+    await event.respond("🔎 کشف دوست شروع شد (حالت: متن دلخواه). گزارش‌ها تو گروه لاگ میاد.",
+                        buttons=main_menu(is_real_owner(event)))
+    asyncio.create_task(_run_discovery(event.sender_id, accounts, prefix, "text", text))
 
 
 # --------------------------------------------------------------------------- #
@@ -4844,6 +7013,7 @@ def _brain_menu(owner_id):
         mark = "✅" if a["id"] in sel else "⬜️"
         rows.append([Button.inline(f"{mark} {a['phone']}", f"bsel_{a['id']}".encode())])
     rows.append([Button.inline("📂 آپلود فایل شماره و شروع", b"bfile")])
+    rows.append([Button.inline("🔎 کشف دوست با پیش‌شماره", b"bdiscover")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     return rows
 
@@ -5079,6 +7249,631 @@ async def _find_marker_local(phone, marker):
             await client.disconnect()
         except Exception:
             pass
+
+
+# =========================================================================== #
+# Item 3: linkdooni engine (موتور لینکدونی)
+#   • harvest GROUP invite links from "linkdooni" channels,
+#   • discover up to N NEW groups/day (grand total), split round-robin across
+#     the selected fleet, each account joins its share,
+#   • send the configured texts into those groups at a per-account interval,
+#   • auto-replace an account that gets banned/muted in a group with a free one,
+#   • run the PV secretary alongside,
+#   • post a per-account stats card every LINKDOONI_SUMMARY_INTERVAL,
+#   • a single stop button shuts the whole engine down.
+# Works for local accounts (full: send + ban-replacement) and remote/worker
+# accounts (join + scheduled send via the worker /linkdooni endpoints).
+# =========================================================================== #
+def _ld_fleet_accounts() -> list:
+    out = []
+    for aid in db.list_linkdooni_account_ids():
+        a = db.get_account(aid)
+        if a and a.get("status") == "active":
+            out.append(a)
+    return out
+
+
+def _ld_pick_reader(fleet: list):
+    """Prefer a local account to read channels; fall back to the first one."""
+    for a in fleet:
+        w = worker.worker_for_account(a)
+        if not w or worker.is_local(w):
+            return a
+    return fleet[0] if fleet else None
+
+
+async def _ld_extract_links(reader, channels: list, want: int) -> list:
+    """Harvest group invite links from the channels using `reader`'s session."""
+    phone = reader["phone"]
+    w = worker.worker_for_account(reader)
+    refs = [c["ref"] for c in channels]
+    if w and not worker.is_local(w):
+        try:
+            res = await worker.api_call(w, "POST", "/linkdooni/extract", {
+                "phone": phone, "channels": refs,
+                "scan": config.LINKDOONI_CHANNEL_SCAN}, timeout=600)
+            return res.get("links", []) or []
+        except Exception:
+            return []
+    links = []
+    async with account_conn.connection(phone) as client:
+        for ref in refs:
+            if len(links) >= want * 3:        # gather a healthy surplus
+                break
+            try:
+                guid, _title = await asyncio.wait_for(
+                    rb.resolve_channel(client, ref), timeout=60)
+            except Exception:
+                continue
+            try:
+                msgs = await asyncio.wait_for(
+                    rb.get_recent_messages(client, guid, config.LINKDOONI_CHANNEL_SCAN),
+                    timeout=90)
+            except Exception:
+                msgs = []
+            for m in msgs:
+                for lk in rb.extract_group_links(rb._msg_text_of(m)):
+                    if lk not in links:
+                        links.append(lk)
+    return links
+
+
+async def _ld_resolve_guid(reader, link: str):
+    """Best-effort: resolve a group invite link to its guid WITHOUT joining."""
+    phone = reader["phone"]
+    w = worker.worker_for_account(reader)
+    if w and not worker.is_local(w):
+        return None       # remote preview unsupported -> rely on join result
+    try:
+        async with account_conn.connection(phone) as client:
+            return await rb.get_group_guid_by_link(client, link)
+    except Exception:
+        return None
+
+
+async def _ld_join(acc, link: str):
+    """Join a group via link on `acc`. Returns the group guid (or None)."""
+    phone = acc["phone"]
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        try:
+            res = await worker.api_call(w, "POST", "/group/join",
+                                        {"phone": phone, "links": [link]}, timeout=120)
+            return None if not res.get("joined") else "joined"
+        except Exception:
+            return None
+    try:
+        async with account_conn.connection(phone) as client:
+            res = await asyncio.wait_for(rb.join_group_by_link(client, link), timeout=90)
+            return rb.join_result_group_guid(res)
+    except Exception:
+        return None
+
+
+async def _ld_discover_join():
+    """One discovery+join cycle, respecting the daily grand-total cap."""
+    cfg = db.get_linkdooni_config()
+    fleet = _ld_fleet_accounts()
+    channels = db.list_linkdooni_channels()
+    if not fleet or not channels:
+        return
+    daily = int(cfg.get("daily_groups") or config.LINKDOONI_DAILY_GROUPS)
+    remaining = daily - db.linkdooni_groups_today_count()
+    if remaining <= 0:
+        return
+    reader = _ld_pick_reader(fleet)
+    links = await _ld_extract_links(reader, channels, remaining)
+    # keep only NEW links (dedup ledger), cap to the remaining daily quota
+    new_links = []
+    for lk in links:
+        if len(new_links) >= remaining:
+            break
+        if db.linkdooni_seen_link(lk):
+            new_links.append(lk)
+    if not new_links:
+        await log(card("📨 لینکدونی — کشف", [
+            "گروه جدیدی پیدا نشد (یا سقف روزانه پر شده).", f"🕒 {now()}"]))
+        return
+    await log(card("📨 لینکدونی — کشف گروه", [
+        f"🔗 لینک جدید : {len(new_links)}",
+        f"📊 سقف روزانه باقی‌مانده : {remaining}",
+        f"👥 اکانت‌ها : {len(fleet)}", f"🕒 {now()}"]))
+    joined = 0
+    failed = 0
+    for i, lk in enumerate(new_links):
+        acc = fleet[i % len(fleet)]
+        guid = await _ld_resolve_guid(reader, lk)
+        joined_guid = await _ld_join(acc, lk)
+        if not guid:
+            guid = joined_guid if (joined_guid and joined_guid != "joined") else None
+        if not guid:
+            failed += 1
+            await log(card("📨 لینکدونی — guid پیدا نشد (رد شد)", [
+                f"📱 {acc['phone']}", f"🔗 {lk}",
+                "این بیلد روبیکا preview لینک رو نداد؛ این گروه رد شد.", f"🕒 {now()}"]))
+            continue
+        db.add_linkdooni_group(guid, lk, acc["id"])
+        db.mark_linkdooni_group_joined(guid, True)
+        db.incr_linkdooni_joined(acc["id"], 1)
+        joined += 1
+        await log(card("📨 لینکدونی — join", [
+            f"📱 {acc['phone']}", f"👥 {guid}", f"🔗 {lk}", f"🕒 {now()}"]))
+        await asyncio.sleep(config.GROUP_JOIN_DELAY)
+    await log(card("📨 لینکدونی — پایان کشف/join", [
+        f"✅ join شده : {joined}   ❌ ناموفق : {failed}", f"🕒 {now()}"]))
+    # (re)start senders so newly joined groups start receiving messages
+    for acc in fleet:
+        await _ld_start_sender(acc)
+
+
+async def _ld_replace(banned_acc, guid: str, name: str, link: str):
+    """A group banned/muted `banned_acc`: hand it to a free fleet account."""
+    fleet = _ld_fleet_accounts()
+    cand = None
+    for a in fleet:
+        if a["id"] != banned_acc["id"]:
+            cand = a
+            break
+    # record the ban for the cleanup engine (same as automation does)
+    try:
+        is_new = db.add_cleanup_candidate(banned_acc["id"], guid, name,
+                                          reason="بن/سکوت در گروه لینکدونی")
+        if is_new:
+            await _log_cleanup_candidate(banned_acc["id"], banned_acc["phone"], guid, name)
+    except Exception:
+        pass
+    if not cand:
+        db.mark_linkdooni_group_joined(guid, False)
+        await log(card("📨 لینکدونی — جایگزین نبود", [
+            f"📱 {banned_acc['phone']} در گروه بن شد ولی اکانت آزادی نیست.",
+            f"👥 {guid}", f"🕒 {now()}"]))
+        return
+    db.reassign_linkdooni_group(guid, cand["id"])
+    joined_guid = await _ld_join(cand, link)
+    if joined_guid:
+        db.mark_linkdooni_group_joined(guid, True)
+        db.incr_linkdooni_joined(cand["id"], 1)
+        await log(card("📨 لینکدونی — جایگزینی اکانت", [
+            f"🚫 {banned_acc['phone']} بن شد",
+            f"✅ جایگزین : {cand['phone']}",
+            f"👥 {guid}", f"🕒 {now()}"]))
+        await _ld_start_sender(cand)        # make sure replacement is sending
+    else:
+        await log(card("📨 لینکدونی — جایگزین join نشد", [
+            f"✅ جایگزین : {cand['phone']} نتونست join کنه",
+            f"👥 {guid}", f"🕒 {now()}"]))
+
+
+async def _run_linkdooni_local(account_id: int, phone: str, st: dict):
+    """Local linkdooni send loop — ONE connection per pass. Reads the account's
+    assigned+joined groups FRESH each pass (so reassignments are picked up),
+    sends a random configured text to each, and triggers auto-replacement when a
+    group bans/mutes the account (3 strikes)."""
+    fails: dict = {}
+    last_text: dict = {}
+    try:
+        while not st.get("stop"):
+            st["heartbeat"] = time.monotonic()
+            texts = db.list_linkdooni_texts()
+            interval = (db.get_linkdooni_config().get("send_interval")
+                        or config.LINKDOONI_SEND_INTERVAL)
+            if texts:
+                try:
+                    async with account_conn.connection(phone) as client:
+                        groups = db.list_linkdooni_groups(account_id, joined_only=True)
+                        st["groups"] = len(groups)
+                        for g in groups:
+                            if st.get("stop"):
+                                break
+                            guid = g["group_guid"]
+                            idx, txt = _pick_text(texts, last_text.get(guid))
+                            if txt is None:
+                                break
+                            try:
+                                await asyncio.wait_for(
+                                    rb.send_text(client, guid, txt),
+                                    timeout=config.SEND_TIMEOUT)
+                                st["sent"] = st.get("sent", 0) + 1
+                                last_text[guid] = idx
+                                fails[guid] = 0
+                                try:
+                                    db.incr_linkdooni_sent(account_id, 1)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                fails[guid] = fails.get(guid, 0) + 1
+                                if fails[guid] >= 3:
+                                    acc = db.get_account(account_id)
+                                    if acc:
+                                        try:
+                                            await _ld_replace(acc, guid,
+                                                              g.get("name", ""),
+                                                              g.get("link", ""))
+                                        except Exception:
+                                            pass
+                                    fails[guid] = 0
+                            await asyncio.sleep(random.uniform(
+                                config.LINKDOONI_GROUP_DELAY_MIN,
+                                config.LINKDOONI_GROUP_DELAY_MAX))
+                except Exception as e:  # noqa: BLE001
+                    account_conn.drop_connection(phone)
+                    if account_conn.is_auth_error(e):
+                        await log(f"⚠️ لینکدونی «{phone}» خطای auth (ادامه): {repr(e)[:120]}")
+            st["heartbeat"] = time.monotonic()
+            waited = 0
+            while waited < interval and not st.get("stop"):
+                await asyncio.sleep(1)
+                waited += 1
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ لینکدونی «{phone}» متوقف شد: {repr(e)[:140]}")
+
+
+async def _ld_start_sender(acc):
+    """Start/refresh the linkdooni send loop for one account (local or remote)."""
+    aid = acc["id"]
+    phone = acc["phone"]
+    interval = config.clamp_linkdooni_interval(
+        db.get_linkdooni_config().get("send_interval"))
+    texts = db.list_linkdooni_texts()
+    groups = db.list_linkdooni_groups(aid, joined_only=True)
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        if not texts or not groups:
+            return
+        try:
+            await worker.api_call(w, "POST", "/linkdooni/start", {
+                "phone": phone,
+                "group_guids": [g["group_guid"] for g in groups],
+                "texts": texts, "interval": interval}, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ لینکدونی ریموت {phone} استارت نشد: {repr(e)[:120]}")
+        return
+    # local: (re)start the task only if it is not already running
+    t = linkdooni_tasks.get(aid)
+    if t and not t["task"].done():
+        return
+    stx = {"stop": False, "sent": (t["state"].get("sent", 0) if t else 0),
+           "groups": 0, "heartbeat": time.monotonic()}
+    task = asyncio.create_task(_run_linkdooni_local(aid, phone, stx))
+    linkdooni_tasks[aid] = {"task": task, "state": stx}
+
+
+async def _ld_stop_sender(acc):
+    aid = acc["id"]
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        try:
+            await worker.api_call(w, "POST", "/linkdooni/stop", {"phone": acc["phone"]})
+        except Exception:
+            pass
+        return
+    t = linkdooni_tasks.pop(aid, None)
+    if t:
+        t["state"]["stop"] = True
+        task = t.get("task")
+        if task and not task.done():
+            task.cancel()
+
+
+async def _ld_start_secretary_fleet():
+    for acc in _ld_fleet_accounts():
+        try:
+            db.set_secretary_enabled(acc["id"], True)
+            await start_secretary(acc)
+        except Exception:
+            pass
+
+
+async def _ld_stop_secretary_fleet():
+    for aid in db.list_linkdooni_account_ids():
+        acc = db.get_account(aid)
+        if not acc:
+            continue
+        try:
+            db.set_secretary_enabled(aid, False)
+            await stop_secretary(acc)
+        except Exception:
+            pass
+
+
+async def _linkdooni_engine_loop():
+    eng = linkdooni_engine
+    last_discover = 0.0
+    await _ld_start_secretary_fleet()
+    while not eng.get("stop"):
+        try:
+            nowm = time.monotonic()
+            if last_discover == 0.0 or (nowm - last_discover) >= config.LINKDOONI_DISCOVER_INTERVAL:
+                await _ld_discover_join()
+                last_discover = time.monotonic()
+            # keep local senders alive (self-heal dead tasks)
+            for acc in _ld_fleet_accounts():
+                await _ld_start_sender(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ موتور لینکدونی خطای دور (ادامه): {repr(e)[:140]}")
+        waited = 0
+        while waited < 60 and not eng.get("stop"):
+            await asyncio.sleep(2)
+            waited += 2
+
+
+async def start_linkdooni_engine():
+    if not _ld_fleet_accounts():
+        return False, "هیچ اکانتی برای لینکدونی انتخاب نشده."
+    if not db.list_linkdooni_channels():
+        return False, "هیچ کانال لینکدونی اضافه نشده."
+    if not db.list_linkdooni_texts():
+        return False, "هیچ متنی برای ارسال تنظیم نشده."
+    db.set_linkdooni_enabled(True)
+    old = linkdooni_engine.get("task")
+    if old and not old.done():
+        linkdooni_engine["stop"] = True
+        try:
+            await asyncio.wait_for(old, timeout=5)
+        except Exception:
+            pass
+    linkdooni_engine["stop"] = False
+    linkdooni_engine["task"] = asyncio.create_task(_linkdooni_engine_loop())
+    await log(card("📨 LINKDOONI ENGINE — روشن", [
+        f"👥 اکانت‌ها : {len(_ld_fleet_accounts())}",
+        f"📋 کانال‌ها : {len(db.list_linkdooni_channels())}",
+        f"✍️ متن‌ها : {len(db.list_linkdooni_texts())}",
+        f"🔢 سقف روزانه گروه : {db.get_linkdooni_config().get('daily_groups')}",
+        f"⏱ فاصله ارسال : {db.get_linkdooni_config().get('send_interval')}s",
+        f"🕒 {now()}"]))
+    return True, "ok"
+
+
+async def stop_linkdooni_engine():
+    db.set_linkdooni_enabled(False)
+    linkdooni_engine["stop"] = True
+    t = linkdooni_engine.get("task")
+    if t and not t.done():
+        try:
+            await asyncio.wait_for(t, timeout=5)
+        except Exception:
+            t.cancel()
+    for acc in _ld_fleet_accounts():
+        await _ld_stop_sender(acc)
+    await _ld_stop_secretary_fleet()
+    await log(card("📨 LINKDOONI ENGINE — خاموش", [f"🕒 {now()}"]))
+
+
+async def linkdooni_summary_loop():
+    """Every LINKDOONI_SUMMARY_INTERVAL, post the per-account stats card (sends +
+    secretary replies + joined groups) with a stop button — only while the
+    engine is enabled."""
+    while True:
+        await asyncio.sleep(config.LINKDOONI_SUMMARY_INTERVAL)
+        try:
+            cfg = db.get_linkdooni_config()
+            if not cfg.get("enabled"):
+                continue
+            fleet_ids = db.list_linkdooni_account_ids()
+            rows = []
+            tot_sent = tot_rep = tot_join = 0
+            for aid in fleet_ids:
+                acc = db.get_account(aid)
+                if not acc:
+                    continue
+                la = db.get_linkdooni_account(aid)
+                sent = int(la.get("sent_total", 0) or 0)
+                joined = int(la.get("joined_total", 0) or 0)
+                try:
+                    rep = int(db.get_secretary(aid).get("replied_total", 0) or 0)
+                except Exception:
+                    rep = 0
+                tot_sent += sent
+                tot_rep += rep
+                tot_join += joined
+                rows.append(f"📱 {acc['phone']} — ✉️ {sent} | 🤖 {rep} منشی | 👥 {joined}")
+            rows.append(LINE)
+            rows.append(f"📊 جمع کل — ✉️ {tot_sent} ارسال | 🤖 {tot_rep} منشی | 👥 {tot_join} گروه")
+            rows.append(f"🕒 {now()}")
+            await bot.send_message(config.LOG_GROUP_ID,
+                card("📨 LINKDOONI — گزارش دوره‌ای", rows),
+                buttons=[[Button.inline("⏹ توقف موتور لینکدونی", b"ld_stop")]])
+        except Exception as e:  # noqa: BLE001
+            print(f"[linkdooni_summary] {e}")
+
+
+async def recover_linkdooni():
+    """On boot, relaunch the linkdooni engine if it was enabled before restart."""
+    try:
+        if db.get_linkdooni_config().get("enabled"):
+            await start_linkdooni_engine()
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ بازگردانی موتور لینکدونی ناموفق: {repr(e)[:120]}")
+
+
+# --------------------------------------------------------------------------- #
+# Linkdooni panel UI
+# --------------------------------------------------------------------------- #
+def _linkdooni_menu_text():
+    cfg = db.get_linkdooni_config()
+    return card("📨 موتور لینکدونی", [
+        f"وضعیت : {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}",
+        f"📋 کانال‌های لینکدونی : {len(db.list_linkdooni_channels())}",
+        f"👥 اکانت‌های انتخابی : {len(db.list_linkdooni_account_ids())}",
+        f"✍️ متن‌ها : {len(db.list_linkdooni_texts())}",
+        f"🔢 سقف گروه روزانه (کل) : {cfg.get('daily_groups')}",
+        f"⏱ فاصله ارسال هر اکانت : {cfg.get('send_interval')}s",
+        LINE,
+        "ربات از کانال‌ها لینک گروه می‌گیره، روزانه گروه‌های جدید رو بین اکانت‌ها"
+        " پخش و join می‌کنه، متن‌ها رو می‌فرسته، و منشی هم همزمان روشنه.",
+    ])
+
+
+def _linkdooni_menu_buttons():
+    cfg = db.get_linkdooni_config()
+    rows = [
+        [Button.inline("➕ افزودن کانال لینکدونی", b"ld_addch"),
+         Button.inline("🗑 پاک‌کردن کانال‌ها", b"ld_clrch")],
+        [Button.inline("👥 انتخاب اکانت‌ها", b"ld_accs")],
+        [Button.inline("✍️ افزودن متن", b"ld_addtext"),
+         Button.inline("🗑 پاک‌کردن متن‌ها", b"ld_clrtext")],
+        [Button.inline("⏱ فاصله ارسال", b"ld_interval"),
+         Button.inline("🔢 سقف روزانه", b"ld_daily")],
+    ]
+    if cfg.get("enabled"):
+        rows.append([Button.inline("⏹ توقف موتور", b"ld_stop")])
+    else:
+        rows.append([Button.inline("▶️ شروع موتور", b"ld_start")])
+    rows.append([Button.inline("🔙 بازگشت به اتومیشن", b"automation")])
+    return rows
+
+
+@bot.on(events.CallbackQuery(data=b"linkdooni"))
+async def linkdooni_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, _linkdooni_menu_text(), buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_addch"))
+async def ld_addch_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_ld_channels"}
+    await safe_edit(event,
+        "📋 لینک/آیدی کانال‌های لینکدونی رو بفرست (هر خط یا با فاصله یکی).\n"
+        "مثال: `@mychannel` یا `https://rubika.ir/mychannel` یا guid کانال (c0...).",
+        buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+async def handle_ld_channels(event, st):
+    state.pop(event.sender_id, None)
+    raw = event.raw_text.strip()
+    refs = [p for p in _re_u.split(r"[\s,]+", raw) if p.strip()]
+    added = 0
+    for r in refs:
+        if db.add_linkdooni_channel(r):
+            added += 1
+    await event.respond(f"✅ {added} کانال لینکدونی اضافه شد "
+                        f"(کل: {len(db.list_linkdooni_channels())}).",
+                        buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_clrch"))
+async def ld_clrch_cb(event):
+    if not is_owner(event):
+        return
+    db.clear_linkdooni_channels()
+    await safe_edit(event, _linkdooni_menu_text(), buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_accs"))
+async def ld_accs_cb(event):
+    if not is_owner(event):
+        return
+    sel = set(db.list_linkdooni_account_ids())
+    rows = []
+    for a in db.list_accounts():
+        mark = "✅" if a["id"] in sel else "⬜️"
+        tag = "" if a["status"] == "active" else " ⚠️"
+        rows.append([Button.inline(f"{mark} {a['phone']}{tag}",
+                                   f"ldacc_{a['id']}".encode())])
+    rows.append([Button.inline("🔙 بازگشت", b"linkdooni")])
+    await safe_edit(event, "👥 اکانت‌های لینکدونی رو انتخاب کن:", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"ldacc_(\\d+)"))
+async def ld_acc_toggle_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    db.toggle_linkdooni_account(aid)
+    await ld_accs_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"ld_addtext"))
+async def ld_addtext_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_ld_text"}
+    await safe_edit(event, "✍️ متن ارسالی رو بفرست (هر بار یک متن؛ می‌تونی چند بار بزنی).",
+                    buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+async def handle_ld_text(event, st):
+    state.pop(event.sender_id, None)
+    txt = event.raw_text.strip()
+    if not txt:
+        await event.respond("متن خالیه.", buttons=_linkdooni_menu_buttons())
+        return
+    db.add_linkdooni_text(txt)
+    await event.respond(f"✅ متن اضافه شد (کل: {len(db.list_linkdooni_texts())}).",
+                        buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_clrtext"))
+async def ld_clrtext_cb(event):
+    if not is_owner(event):
+        return
+    db.clear_linkdooni_texts()
+    await safe_edit(event, _linkdooni_menu_text(), buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_interval"))
+async def ld_interval_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_ld_interval"}
+    await safe_edit(event,
+        f"⏱ فاصله ارسال هر اکانت (ثانیه) رو بفرست "
+        f"(بین {config.LINKDOONI_MIN_INTERVAL} تا {config.LINKDOONI_MAX_INTERVAL}):",
+        buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+async def handle_ld_interval(event, st):
+    state.pop(event.sender_id, None)
+    db.set_linkdooni_interval(event.raw_text.strip())
+    await event.respond(
+        f"✅ فاصله ارسال روی {db.get_linkdooni_config().get('send_interval')} ثانیه تنظیم شد.",
+        buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_daily"))
+async def ld_daily_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_ld_daily"}
+    await safe_edit(event, "🔢 سقف گروه‌های جدید روزانه (کل، نه per-account) رو بفرست:",
+                    buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+async def handle_ld_daily(event, st):
+    state.pop(event.sender_id, None)
+    db.set_linkdooni_daily_groups(event.raw_text.strip())
+    await event.respond(
+        f"✅ سقف روزانه روی {db.get_linkdooni_config().get('daily_groups')} گروه تنظیم شد.",
+        buttons=_linkdooni_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"ld_start"))
+async def ld_start_cb(event):
+    if not is_owner(event):
+        return
+    ok, msg = await start_linkdooni_engine()
+    if not ok:
+        await event.answer(msg, alert=True)
+        return
+    await safe_edit(event,
+        "▶️ موتور لینکدونی روشن شد. کشف/join و ارسال در گروه لاگ گزارش می‌شه.\n"
+        "هر ۲۰ دقیقه کارت آماری با دکمه‌ی توقف میاد.",
+        buttons=[[Button.inline("⏹ توقف موتور", b"ld_stop")],
+                 [Button.inline("🔙 بازگشت", b"linkdooni")]])
+
+
+@bot.on(events.CallbackQuery(data=b"ld_stop"))
+async def ld_stop_cb(event):
+    if not is_owner(event):
+        return
+    await event.answer("در حال خاموش‌کردن موتور لینکدونی ...")
+    await stop_linkdooni_engine()
+    await safe_edit(event, "⏹ موتور لینکدونی خاموش شد.",
+                    buttons=[[Button.inline("🔙 بازگشت", b"linkdooni")]])
 
 
 # --------------------------------------------------------------------------- #

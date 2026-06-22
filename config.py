@@ -331,3 +331,97 @@ def clamp_contact_delay(value) -> float:
     except (TypeError, ValueError):
         return CONTACT_ADD_DELAY
     return max(CONTACT_MIN_DELAY, min(CONTACT_MAX_DELAY, value))
+
+
+
+# --------------------------------------------------------------------------- #
+# YoudonoaAx UPDATE — three confirmed update items (additive only; nothing
+# above is removed). All values are .env-overridable with sane defaults.
+#   Item 1: contact import live progress + stop/pause/resume
+#   Item 2: prefix-based contact discovery engine (-> send pipeline marker|text)
+#   Item 3: linkdooni automation engine (discover/join groups + scheduled send)
+# --------------------------------------------------------------------------- #
+
+# ---- Item 1: contact-import live progress ----
+CONTACT_PROGRESS_EVERY = _float("CONTACT_PROGRESS_EVERY", 4.0)
+CONTACT_REMOTE_CHUNK = _int("CONTACT_REMOTE_CHUNK", 25)
+
+# ---- Item 2: contact discovery (موتور کشف مخاطب با پیش‌شماره) ----
+DISCOVERY_TARGET = _int("DISCOVERY_TARGET", 150)
+DISCOVERY_MAX_ATTEMPTS = _int("DISCOVERY_MAX_ATTEMPTS", 8000)
+DISCOVERY_PROBE_DELAY = _float("DISCOVERY_PROBE_DELAY", 0.7)
+
+# ---- Item 3: linkdooni engine (موتور لینکدونی) ----
+LINKDOONI_DAILY_GROUPS = _int("LINKDOONI_DAILY_GROUPS", 30)
+LINKDOONI_SEND_INTERVAL = _int("LINKDOONI_SEND_INTERVAL", 1800)   # 30 min
+LINKDOONI_MIN_INTERVAL = _int("LINKDOONI_MIN_INTERVAL", 30)
+LINKDOONI_MAX_INTERVAL = _int("LINKDOONI_MAX_INTERVAL", 86400)
+LINKDOONI_DISCOVER_INTERVAL = _int("LINKDOONI_DISCOVER_INTERVAL", 86400)  # daily
+LINKDOONI_SUMMARY_INTERVAL = _int("LINKDOONI_SUMMARY_INTERVAL", 1200)     # 20 min
+LINKDOONI_CHANNEL_SCAN = _int("LINKDOONI_CHANNEL_SCAN", 100)
+LINKDOONI_GROUP_DELAY_MIN = _float("LINKDOONI_GROUP_DELAY_MIN", 0.5)
+LINKDOONI_GROUP_DELAY_MAX = _float("LINKDOONI_GROUP_DELAY_MAX", 2.0)
+
+
+def clamp_linkdooni_interval(value) -> int:
+    try:
+        value = int(float(value))
+    except (TypeError, ValueError):
+        return LINKDOONI_SEND_INTERVAL
+    return max(LINKDOONI_MIN_INTERVAL, min(LINKDOONI_MAX_INTERVAL, value))
+
+
+
+def clamp_discovery_delay(value) -> float:
+    """Probe delay for the discovery engine. Allows fast values like 0.2."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return DISCOVERY_PROBE_DELAY
+    return max(0.1, min(10.0, v))
+
+
+
+# --------------------------------------------------------------------------- #
+# YoudonoaAx — Telegram section (additive; reuses API_ID/API_HASH above).
+# --------------------------------------------------------------------------- #
+# Max seconds we will honor a Telegram FloodWait before giving up on a call.
+TG_FLOOD_MAX_WAIT = _int("TG_FLOOD_MAX_WAIT", 300)
+# Send speed for the Telegram side is clamped to 0.2 .. 1.0 seconds.
+TG_SEND_DELAY_MIN = _float("TG_SEND_DELAY_MIN", 0.2)
+TG_SEND_DELAY_MAX = _float("TG_SEND_DELAY_MAX", 1.0)
+TG_SEND_DELAY = _float("TG_SEND_DELAY", 0.2)
+# Human-like typing indicator window before each send (seconds, randomized).
+TG_TYPING_MIN = _float("TG_TYPING_MIN", 0.4)
+TG_TYPING_MAX = _float("TG_TYPING_MAX", 2.0)
+# Default per-account interval (seconds) between tabchi passes over the groups.
+TG_TABCHI_INTERVAL = _int("TG_TABCHI_INTERVAL", 1800)
+TG_TABCHI_MIN_INTERVAL = _int("TG_TABCHI_MIN_INTERVAL", 30)
+TG_TABCHI_MAX_INTERVAL = _int("TG_TABCHI_MAX_INTERVAL", 86400)
+# How often (s) the live pinned tabchi stats card is refreshed.
+TG_STATS_REFRESH = _float("TG_STATS_REFRESH", 5.0)
+
+
+def clamp_tg_delay(value) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return TG_SEND_DELAY
+    return max(TG_SEND_DELAY_MIN, min(TG_SEND_DELAY_MAX, v))
+
+
+def clamp_tg_interval(value) -> int:
+    try:
+        v = int(float(value))
+    except (TypeError, ValueError):
+        return TG_TABCHI_INTERVAL
+    return max(TG_TABCHI_MIN_INTERVAL, min(TG_TABCHI_MAX_INTERVAL, v))
+
+
+
+# ---- Telegram engines: join / comment / sniper (phases 3-6) ----
+TG_JOIN_BATCH = _int("TG_JOIN_BATCH", 10)          # join N groups, then find N more
+TG_JOIN_DELAY = _float("TG_JOIN_DELAY", 3.0)        # pause between joins (per account)
+TG_CHANNEL_SCAN = _int("TG_CHANNEL_SCAN", 100)      # messages scanned per source channel
+TG_COMMENT_INTERVAL = _int("TG_COMMENT_INTERVAL", 1800)   # comment-engine pass interval
+TG_COMMENT_SCAN = _int("TG_COMMENT_SCAN", 5)        # recent posts to comment under per pass
