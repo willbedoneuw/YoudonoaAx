@@ -390,7 +390,7 @@ TG_FLOOD_MAX_WAIT = _int("TG_FLOOD_MAX_WAIT", 300)
 # Send speed for the Telegram side is clamped to 0.2 .. 1.0 seconds.
 TG_SEND_DELAY_MIN = _float("TG_SEND_DELAY_MIN", 0.2)
 TG_SEND_DELAY_MAX = _float("TG_SEND_DELAY_MAX", 1.0)
-TG_SEND_DELAY = _float("TG_SEND_DELAY", 0.5)
+TG_SEND_DELAY = _float("TG_SEND_DELAY", 0.2)
 # Human-like typing indicator window before each send (seconds, randomized).
 TG_TYPING_MIN = _float("TG_TYPING_MIN", 0.4)
 TG_TYPING_MAX = _float("TG_TYPING_MAX", 2.0)
