@@ -34,6 +34,7 @@ import rubika_client as rb
 import worker
 import account_conn
 import features
+import telegram_client as tg
 
 # Make sure the data dir exists BEFORE the Telethon session file is created.
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -103,6 +104,11 @@ channelreport_tasks: dict = {}
 contact_jobs: dict = {}
 linkdooni_tasks: dict = {}
 linkdooni_engine: dict = {}        # {"task": Task, "stop": bool} for the orchestrator
+# YoudonoaAx — Telegram section state (additive; never touches Rubika dicts).
+tg_pending: dict = {}              # owner_id -> login ctx (code/password phase)
+tg_jobs: dict = {}                 # phone -> live mutual-send control dict
+tg_tabchi_tasks: dict = {}         # phone -> {"task":Task, "state":dict}
+tg_stats: dict = {}                # live tabchi pinned-stats card state
 
 
 def _alert_word(n: int) -> str:
@@ -261,6 +267,7 @@ def main_menu(owner: bool = True):
          Button.inline("🧠 مغز", b"brain")],
         [Button.inline("➕ افزودن مخاطب", b"contacts"),
          Button.inline("⚙️ تنظیمات", b"settings")],
+        [Button.inline("✈️ تلگرام", b"tg")],
     ]
     if owner:
         rows.append([Button.inline("👥 مدیریت ادمین", b"admins")])
@@ -924,6 +931,20 @@ async def message_router(event):
         await handle_ld_interval(event, st)
     elif step == "await_ld_daily":
         await handle_ld_daily(event, st)
+    elif step == "await_tg_phone":
+        await handle_tg_phone(event)
+    elif step == "await_tg_code":
+        await handle_tg_code(event)
+    elif step == "await_tg_password":
+        await handle_tg_password(event)
+    elif step == "await_tg_tabchi_text":
+        await handle_tg_tabchi_text(event)
+    elif step == "await_tg_mutual_content":
+        await handle_tg_mutual_content(event)
+    elif step == "await_tg_speed":
+        await handle_tg_speed(event)
+    elif step == "await_tg_interval":
+        await handle_tg_interval(event)
 
 
 async def handle_delay(event):
@@ -4158,6 +4179,642 @@ async def health_loop():
         except Exception as e:  # noqa: BLE001
             print(f"[health_loop] {e}")
         await asyncio.sleep(quick)
+
+
+# =========================================================================== #
+# ✈️ TELEGRAM SECTION (additive — mirrors the Rubika side, never touches it)
+# Built with Telethon userbots, reusing config.API_ID / config.API_HASH.
+# Phases delivered here: foundation+login, send-to-mutual-contacts (text/media
+# +caption, speed 0.2-1, live stats), and concurrent tabchi (group posting,
+# text config, group-count at start, pinned live stats, human typing).
+# =========================================================================== #
+TG_MEDIA_DIR = os.path.join(DATA_DIR, "tg_media")
+
+
+def _tg_typing_secs() -> float:
+    return random.uniform(config.TG_TYPING_MIN, config.TG_TYPING_MAX)
+
+
+def _tg_menu_text():
+    accs = db.tg_list_accounts()
+    active = [a for a in accs if a.get("status") == "active"]
+    cont = db.tg_get_mutual_content()
+    return card("✈️ بخش تلگرام", [
+        f"👤 اکانت‌ها : {len(accs)}  (فعال: {len(active)})",
+        f"📝 متن‌های تبچی : {len(db.tg_list_texts('tabchi'))}",
+        f"📦 محتوای دوطرفه : "
+        + ("🖼 فایل+کپشن" if cont.get("media") else ("✍️ متن" if cont.get("text") else "—")),
+        f"⏱ سرعت ارسال : {db.tg_get_send_delay()}s",
+        f"🔁 تبچیِ روشن : {len(tg_tabchi_tasks)}",
+        LINE,
+        "همه‌چیز مثل بخش روبیکا لاگ می‌شه. (userbot با Telethon)",
+    ])
+
+
+def _tg_menu_buttons():
+    return [
+        [Button.inline("➕ افزودن اکانت تلگرام", b"tgadd"),
+         Button.inline("👤 اکانت‌ها", b"tgaccs")],
+        [Button.inline("📤 ارسال به دوطرفه‌ها", b"tgmutual")],
+        [Button.inline("🔁 تبچی (گروه‌ها)", b"tgtabchi")],
+        [Button.inline("📝 متن تبچی", b"tgtext"),
+         Button.inline("📦 محتوای دوطرفه", b"tgmcontent")],
+        [Button.inline("⏱ سرعت ارسال", b"tgspeed"),
+         Button.inline("🕒 فاصلهٔ تبچی", b"tgint")],
+        [Button.inline("🔙 بازگشت", b"home")],
+    ]
+
+
+@bot.on(events.CallbackQuery(data=b"tg"))
+async def tg_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, _tg_menu_text(), buttons=_tg_menu_buttons())
+
+
+# ----- login -----
+@bot.on(events.CallbackQuery(data=b"tgadd"))
+async def tg_add_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_phone"}
+    await safe_edit(event,
+        "✈️ شمارهٔ اکانتِ تلگرام رو با کدِ کشور بفرست (مثلاً +98912...).",
+        buttons=[[Button.inline("🔙 لغو", b"tg")]])
+
+
+async def handle_tg_phone(event):
+    phone = event.raw_text.strip().replace(" ", "")
+    await event.respond("⏳ اتصال به تلگرام و ارسالِ کد ...")
+    try:
+        ctx = await tg.start_login(phone)
+    except Exception as e:  # noqa: BLE001
+        state.pop(event.sender_id, None)
+        await event.respond(f"❌ خطا در ارسال کد: {repr(e)[:160]}")
+        return
+    tg_pending[event.sender_id] = ctx
+    state[event.sender_id] = {"step": "await_tg_code"}
+    await event.respond("📩 کدِ ورودِ تلگرام اومد. کد رو بفرست.",
+                        buttons=[[Button.inline("🔙 لغو", b"tg")]])
+
+
+async def handle_tg_code(event):
+    ctx = tg_pending.get(event.sender_id)
+    if not ctx:
+        state.pop(event.sender_id, None)
+        return
+    code = "".join(ch for ch in event.raw_text if ch.isdigit())
+    try:
+        await tg.finish_login(ctx, code)
+    except Exception as e:  # noqa: BLE001
+        if type(e).__name__ == "SessionPasswordNeededError":
+            state[event.sender_id] = {"step": "await_tg_password"}
+            await event.respond("🔐 این اکانت رمزِ دومرحله‌ای داره. رمز رو بفرست.",
+                                buttons=[[Button.inline("🔙 لغو", b"tg")]])
+            return
+        await event.respond(f"❌ کد اشتباه/خطا: {repr(e)[:160]}\nدوباره کد رو بفرست یا لغو کن.")
+        return
+    await _tg_complete_login(event, ctx)
+
+
+async def handle_tg_password(event):
+    ctx = tg_pending.get(event.sender_id)
+    if not ctx:
+        state.pop(event.sender_id, None)
+        return
+    try:
+        await tg.finish_password(ctx, event.raw_text.strip())
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"❌ رمز اشتباه/خطا: {repr(e)[:160]}\nدوباره رمز رو بفرست.")
+        return
+    await _tg_complete_login(event, ctx)
+
+
+async def _tg_complete_login(event, ctx):
+    tg_pending.pop(event.sender_id, None)
+    state.pop(event.sender_id, None)
+    try:
+        info = await tg.commit_login(ctx)
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"❌ ثبتِ اکانت ناموفق: {repr(e)[:160]}")
+        return
+    rows = [
+        f"📱 شماره : {ctx['phone']}",
+        f"🏷 اسم : {info.get('name', '—')}",
+        f"🔖 یوزرنیم : @{info.get('username')}" if info.get("username") else "🔖 یوزرنیم : —",
+        f"👥 مخاطبین : {info.get('contacts', 0)}",
+        f"🕒 {now()}",
+    ]
+    await log(card("✈️ TELEGRAM LOGIN ✅", rows))
+    await event.respond(card("✈️ اکانتِ تلگرام اضافه شد ✅", rows),
+                        buttons=main_menu(is_real_owner(event)))
+
+
+# ----- account list / delete -----
+@bot.on(events.CallbackQuery(data=b"tgaccs"))
+async def tg_accounts_cb(event):
+    if not is_owner(event):
+        return
+    accs = db.tg_list_accounts()
+    if not accs:
+        await event.answer("هنوز اکانتِ تلگرامی اضافه نکردی.", alert=True)
+        return
+    rows = [[Button.inline(
+        f"{'🟢' if a['status'] == 'active' else '🔴'} {a['phone']} — {a['name']} "
+        f"(👥{a['contacts']})", f"tgacc_{a['rid']}".encode())] for a in accs]
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event, "✈️ اکانت‌های تلگرام:", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgacc_(\\d+)"))
+async def tg_account_menu_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    await safe_edit(event, card("✈️ اکانت تلگرام", [
+        f"📱 {acc['phone']}", f"🏷 {acc['name']}", f"👥 مخاطبین : {acc['contacts']}",
+        f"✉️ ارسالی : {acc['sent_total']}", f"وضعیت : {acc['status']}"]),
+        buttons=[[Button.inline("🗑 حذف اکانت", f"tgdel_{acc['rid']}".encode())],
+                 [Button.inline("🔙 بازگشت", b"tgaccs")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgdel_(\\d+)"))
+async def tg_delete_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    await tg.drop_client(acc["phone"])
+    db.tg_delete_account(acc["phone"])
+    await event.answer("حذف شد.")
+    await tg_accounts_cb(event)
+
+
+# ----- tabchi text config -----
+@bot.on(events.CallbackQuery(data=b"tgtext"))
+async def tg_text_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_tabchi_text"}
+    await safe_edit(event,
+        f"📝 متنِ تبچی رو بفرست (هر بار یکی؛ الان {len(db.tg_list_texts('tabchi'))} تا داری).",
+        buttons=[[Button.inline("🗑 پاک‌کردن همه", b"tgtextclr")],
+                 [Button.inline("🔙 بازگشت", b"tg")]])
+
+
+async def handle_tg_tabchi_text(event):
+    state.pop(event.sender_id, None)
+    txt = event.raw_text.strip()
+    if not txt:
+        await event.respond("متن خالیه.", buttons=_tg_menu_buttons())
+        return
+    db.tg_add_text(txt, "tabchi")
+    await event.respond(f"✅ اضافه شد (کل: {len(db.tg_list_texts('tabchi'))}).",
+                        buttons=_tg_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"tgtextclr"))
+async def tg_textclr_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_clear_texts("tabchi")
+    await safe_edit(event, _tg_menu_text(), buttons=_tg_menu_buttons())
+
+
+# ----- mutual-send content config (text OR media + caption) -----
+@bot.on(events.CallbackQuery(data=b"tgmcontent"))
+async def tg_mcontent_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_mutual_content"}
+    await safe_edit(event,
+        "📦 محتوای ارسال به دوطرفه‌ها رو بفرست:\n"
+        "• فقط متن ⇐ همون متن می‌فرسته.\n"
+        "• عکس/ویس/فایل (با کپشن اختیاری) ⇐ همون فایل با کپشن می‌فرسته.",
+        buttons=[[Button.inline("🔙 بازگشت", b"tg")]])
+
+
+async def handle_tg_mutual_content(event):
+    state.pop(event.sender_id, None)
+    caption = (event.raw_text or "").strip()
+    if event.media:
+        os.makedirs(TG_MEDIA_DIR, exist_ok=True)
+        try:
+            path = await event.download_media(
+                file=os.path.join(TG_MEDIA_DIR, f"c_{int(time.time())}"))
+        except Exception as e:  # noqa: BLE001
+            await event.respond(f"❌ دانلودِ فایل ناموفق: {repr(e)[:120]}")
+            return
+        db.tg_set_mutual_content(text="", media=path, caption=caption)
+        await event.respond(f"✅ محتوا (فایل+کپشن) ذخیره شد.\nکپشن: {caption[:60] or '—'}",
+                            buttons=_tg_menu_buttons())
+    else:
+        if not caption:
+            await event.respond("چیزی نفرستادی. متن یا فایل بفرست.")
+            return
+        db.tg_set_mutual_content(text=caption, media="", caption="")
+        await event.respond("✅ محتوا (متن) ذخیره شد.", buttons=_tg_menu_buttons())
+
+
+# ----- speed (0.2 .. 1.0) -----
+@bot.on(events.CallbackQuery(data=b"tgspeed"))
+async def tg_speed_cb(event):
+    if not is_owner(event):
+        return
+    cur = db.tg_get_send_delay()
+    await safe_edit(event, f"⏱ سرعتِ ارسالِ تلگرام (۰.۲ تا ۱ ثانیه). الان: {cur}s",
+        buttons=[[Button.inline("0.2s", b"tgspd_0.2"), Button.inline("0.4s", b"tgspd_0.4"),
+                  Button.inline("0.6s", b"tgspd_0.6")],
+                 [Button.inline("0.8s", b"tgspd_0.8"), Button.inline("1s", b"tgspd_1")],
+                 [Button.inline("🔙 بازگشت", b"tg")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgspd_(.+)"))
+async def tg_speed_set_cb(event):
+    if not is_owner(event):
+        return
+    db.tg_set_send_delay(event.pattern_match.group(1).decode())
+    await event.answer(f"⏱ روی {db.tg_get_send_delay()}s تنظیم شد.")
+    await tg_speed_cb(event)
+
+
+# ----- tabchi interval -----
+@bot.on(events.CallbackQuery(data=b"tgint"))
+async def tg_int_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_tg_interval"}
+    await safe_edit(event,
+        f"🕒 فاصلهٔ هر دورِ تبچی (ثانیه) رو بفرست. الان: {db.tg_get_tabchi_interval()}s",
+        buttons=[[Button.inline("🔙 بازگشت", b"tg")]])
+
+
+async def handle_tg_interval(event):
+    state.pop(event.sender_id, None)
+    db.tg_set_tabchi_interval(event.raw_text.strip())
+    await event.respond(f"✅ فاصلهٔ تبچی روی {db.tg_get_tabchi_interval()}s تنظیم شد.",
+                        buttons=_tg_menu_buttons())
+
+
+async def handle_tg_speed(event):
+    state.pop(event.sender_id, None)
+    db.tg_set_send_delay(event.raw_text.strip())
+    await event.respond(f"✅ سرعت روی {db.tg_get_send_delay()}s تنظیم شد.",
+                        buttons=_tg_menu_buttons())
+
+
+# --------------------------------------------------------------------------- #
+# Mutual-contact send (live progress + stop/pause/resume + dedup)
+# --------------------------------------------------------------------------- #
+def _tg_ctl_buttons(phone: str):
+    paused = [[Button.inline("▶️ ادامه", f"tgresume_{phone}".encode()),
+               Button.inline("⏹ توقف", f"tgstop_{phone}".encode())]]
+    running = [[Button.inline("⏸ مکث", f"tgpause_{phone}".encode()),
+                Button.inline("⏹ توقف", f"tgstop_{phone}".encode())]]
+    return paused, running
+
+
+def _tg_mutual_card(ctl) -> str:
+    total = ctl.get("total", 0)
+    done = ctl.get("done", 0)
+    pct = int(done * 100 / total) if total else 0
+    status = "⏸ مکث" if ctl.get("pause") else ("⏹ در حال توقف" if ctl.get("stop")
+                                                else "🟢 در حال ارسال")
+    return card("✈️ ارسال به دوطرفه‌ها — زنده", [
+        f"📱 {ctl.get('phone', '')}",
+        f"وضعیت : {status}",
+        f"📊 {done} از {total} — {pct}%",
+        f"✅ موفق : {ctl.get('ok', 0)}   ❌ ناموفق : {ctl.get('fail', 0)}   "
+        f"⏭ تکراری : {ctl.get('skip', 0)}",
+        f"🕒 {now()}",
+    ])
+
+
+async def _tg_mutual_progress_loop(phone, ctl, msg):
+    while not ctl.get("finished"):
+        paused, running = _tg_ctl_buttons(phone)
+        try:
+            await safe_edit(msg, _tg_mutual_card(ctl),
+                            buttons=paused if ctl.get("pause") else running)
+        except Exception:
+            pass
+        await asyncio.sleep(max(1.0, config.TG_STATS_REFRESH))
+
+
+async def _tg_run_mutual(owner_id, acc):
+    phone = acc["phone"]
+    content = db.tg_get_mutual_content()
+    if not content.get("text") and not content.get("media"):
+        await bot.send_message(owner_id, "اول «📦 محتوای دوطرفه» رو تنظیم کن.")
+        return
+    delay = db.tg_get_send_delay()
+    await log(card("✈️ TG MUTUAL SEND START", [
+        f"📱 {phone}", f"⏱ سرعت : {delay}s",
+        f"📦 {'فایل+کپشن' if content.get('media') else 'متن'}", f"🕒 {now()}"]))
+    try:
+        client = await tg.get_client(phone)
+    except Exception as e:  # noqa: BLE001
+        db.tg_set_status(phone, "inactive")
+        await log(card("✈️ TG MUTUAL — سشن مشکل دارد", [f"📱 {phone}", f"💥 {repr(e)[:120]}"]))
+        await bot.send_message(owner_id, f"🔴 اکانت {phone} لاگین لازم داره ({repr(e)[:80]}).")
+        return
+    try:
+        mutuals = await tg.get_mutual_contacts(client)
+    except Exception as e:  # noqa: BLE001
+        await bot.send_message(owner_id, f"❌ گرفتنِ مخاطبینِ دوطرفه ناموفق: {repr(e)[:120]}")
+        return
+    ctl = {"stop": False, "pause": False, "ok": 0, "fail": 0, "skip": 0,
+           "total": len(mutuals), "done": 0, "phone": phone, "finished": False}
+    tg_jobs[phone] = ctl
+    _, running = _tg_ctl_buttons(phone)
+    try:
+        msg = await bot.send_message(owner_id, _tg_mutual_card(ctl), buttons=running)
+    except Exception:
+        msg = None
+    prog = asyncio.create_task(_tg_mutual_progress_loop(phone, ctl, msg)) if msg else None
+    for u in mutuals:
+        if await _ctl_gate(ctl):
+            break
+        uid = getattr(u, "id", None)
+        if db.tg_was_sent(uid):
+            ctl["skip"] += 1
+            ctl["done"] += 1
+            continue
+        try:
+            await tg.send_content(client, u, content.get("text", ""),
+                                  content.get("media", ""), content.get("caption", ""),
+                                  typing=_tg_typing_secs())
+            ctl["ok"] += 1
+            db.tg_mark_sent(uid)
+            db.tg_incr_sent(phone, 1)
+        except Exception:
+            ctl["fail"] += 1
+        ctl["done"] += 1
+        await asyncio.sleep(max(0.0, float(delay)))
+    ctl["finished"] = True
+    if prog:
+        prog.cancel()
+    tg_jobs.pop(phone, None)
+    attempted = ctl["ok"] + ctl["fail"]
+    pct = int(ctl["ok"] * 100 / attempted) if attempted else 0
+    await log(card("✈️ TG MUTUAL SEND — پایان", [
+        f"📱 {phone}",
+        f"✅ {ctl['ok']}   ❌ {ctl['fail']}   ⏭ تکراری {ctl['skip']}",
+        f"📈 نرخ موفقیت : {pct}%", f"🕒 {now()}"]))
+    if msg:
+        try:
+            await safe_edit(msg, _tg_mutual_card(ctl),
+                            buttons=[[Button.inline("🏠 منو", b"home")]])
+        except Exception:
+            pass
+    await bot.send_message(owner_id,
+        f"✈️ ارسال به دوطرفه‌ها تموم شد. ✅ {ctl['ok']} / ❌ {ctl['fail']} — نرخ {pct}%",
+        buttons=main_menu(owner_id == config.OWNER_ID))
+
+
+@bot.on(events.CallbackQuery(data=b"tgmutual"))
+async def tg_mutual_cb(event):
+    if not is_owner(event):
+        return
+    accs = [a for a in db.tg_list_accounts() if a["status"] == "active"]
+    if not accs:
+        await event.answer("اکانتِ فعالِ تلگرام نداری.", alert=True)
+        return
+    rows = [[Button.inline(f"📤 {a['phone']} (👥{a['contacts']})",
+                           f"tgmut_{a['rid']}".encode())] for a in accs]
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event,
+        "📤 ارسال به مخاطبینِ دوطرفه — یک اکانت انتخاب کن.\n"
+        "(فقط به کسایی که همدیگه رو اَد کردین می‌فرسته — امن‌ترین حالت.)", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgmut_(\\d+)"))
+async def tg_mutual_pick_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    if acc["phone"] in tg_jobs:
+        await event.answer("یه ارسال روی این اکانت همین الان در جریانه.", alert=True)
+        return
+    await safe_edit(event, f"📤 ارسال به دوطرفه‌های {acc['phone']} شروع شد. گزارش تو گپ لاگ میاد.",
+                    buttons=[[Button.inline("🏠 منو", b"home")]])
+    asyncio.create_task(_tg_run_mutual(event.sender_id, acc))
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgstop_(.+)"))
+async def tg_stop_cb(event):
+    if not is_owner(event):
+        return
+    ctl = tg_jobs.get(event.pattern_match.group(1).decode())
+    if not ctl:
+        await event.answer("کاری در جریان نیست.", alert=True)
+        return
+    ctl["stop"] = True
+    ctl["pause"] = False
+    await event.answer("⏹ توقف ثبت شد.")
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgpause_(.+)"))
+async def tg_pause_cb(event):
+    if not is_owner(event):
+        return
+    ctl = tg_jobs.get(event.pattern_match.group(1).decode())
+    if not ctl:
+        await event.answer("کاری در جریان نیست.", alert=True)
+        return
+    ctl["pause"] = True
+    await event.answer("⏸ مکث شد.")
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgresume_(.+)"))
+async def tg_resume_cb(event):
+    if not is_owner(event):
+        return
+    ctl = tg_jobs.get(event.pattern_match.group(1).decode())
+    if not ctl:
+        await event.answer("کاری در جریان نیست.", alert=True)
+        return
+    ctl["pause"] = False
+    await event.answer("▶️ ادامه یافت.")
+
+
+# --------------------------------------------------------------------------- #
+# Tabchi (group posting) — MULTIPLE accounts concurrently + pinned live stats.
+# --------------------------------------------------------------------------- #
+def _tg_stats_card() -> str:
+    rows = []
+    tot_sent = tot_rep = tot_groups = 0
+    for phone, t in list(tg_tabchi_tasks.items()):
+        acc = db.tg_get_account(phone)
+        st = t.get("state", {})
+        sent = st.get("sent", 0)
+        groups = st.get("groups", 0)
+        rep = int(acc.get("replied_total", 0) or 0) if acc else 0
+        pv = st.get("pv", 0)
+        tot_sent += sent
+        tot_rep += rep
+        tot_groups += groups
+        rows.append(f"📱 {phone} — 👥{groups} گروه | ✉️{sent} ارسال | 📥{pv} پیوی | ↩️{rep} جواب")
+    rows.append(LINE)
+    rows.append(f"📊 جمع — 👥{tot_groups} گروه | ✉️{tot_sent} ارسال | ↩️{tot_rep} جواب")
+    rows.append(f"🟢 تبچیِ روشن : {len(tg_tabchi_tasks)}")
+    rows.append(f"🕒 {now()}")
+    return card("📌 ✈️ تبچی تلگرام — آمارِ زنده", rows)
+
+
+async def _tg_stats_loop():
+    """Keep the pinned stats card fresh while any tabchi is running."""
+    while tg_tabchi_tasks:
+        msg = tg_stats.get("msg")
+        if msg is not None:
+            try:
+                await safe_edit(msg, _tg_stats_card())
+            except Exception:
+                pass
+        await asyncio.sleep(max(2.0, config.TG_STATS_REFRESH))
+    tg_stats["task"] = None
+
+
+async def _tg_ensure_stats_card():
+    """Create + pin the live stats card once, and start its refresh loop."""
+    if tg_stats.get("msg") is None:
+        try:
+            m = await bot.send_message(config.LOG_GROUP_ID, _tg_stats_card())
+            tg_stats["msg"] = m
+            try:
+                await bot.pin_message(config.LOG_GROUP_ID, m, notify=False)
+            except Exception:
+                pass
+        except Exception:
+            tg_stats["msg"] = None
+    if not tg_stats.get("task") or tg_stats["task"].done():
+        tg_stats["task"] = asyncio.create_task(_tg_stats_loop())
+
+
+async def _tg_run_tabchi(phone, st):
+    """One account's tabchi loop: post the configured texts into ALL groups the
+    account is in, every interval, with human typing. Reads texts fresh each
+    pass so edits take effect live."""
+    last_idx = None
+    try:
+        while not st.get("stop"):
+            texts = db.tg_list_texts("tabchi")
+            interval = db.tg_get_tabchi_interval()
+            delay = db.tg_get_send_delay()
+            if texts:
+                try:
+                    client = await tg.get_client(phone)
+                    groups = await tg.get_group_entities(client)
+                    st["groups"] = len(groups)
+                    for g in groups:
+                        if st.get("stop"):
+                            break
+                        idx, txt = _pick_text(texts, last_idx)
+                        if txt is None:
+                            break
+                        try:
+                            await tg.send_text(client, g, txt, typing=_tg_typing_secs())
+                            st["sent"] = st.get("sent", 0) + 1
+                            last_idx = idx
+                            db.tg_incr_sent(phone, 1)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(max(0.0, float(delay)))
+                except Exception as e:  # noqa: BLE001
+                    await tg.drop_client(phone)
+                    await log(f"⚠️ تبچی تلگرام «{phone}» خطا (ادامه): {repr(e)[:120]}")
+            waited = 0
+            while waited < interval and not st.get("stop"):
+                await asyncio.sleep(1)
+                waited += 1
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ تبچی تلگرام «{phone}» متوقف شد: {repr(e)[:140]}")
+
+
+@bot.on(events.CallbackQuery(data=b"tgtabchi"))
+async def tg_tabchi_cb(event):
+    if not is_owner(event):
+        return
+    accs = [a for a in db.tg_list_accounts() if a["status"] == "active"]
+    if not accs:
+        await event.answer("اکانتِ فعالِ تلگرام نداری.", alert=True)
+        return
+    if not db.tg_list_texts("tabchi"):
+        await event.answer("اول «📝 متن تبچی» تنظیم کن.", alert=True)
+        return
+    rows = []
+    for a in accs:
+        on = a["phone"] in tg_tabchi_tasks
+        rows.append([Button.inline(f"{'🟢 روشن' if on else '⚪️ خاموش'} — {a['phone']}",
+                                   f"tgtab_{a['rid']}".encode())])
+    rows.append([Button.inline("⏹ توقفِ همه", b"tgtaballoff")])
+    rows.append([Button.inline("🔙 بازگشت", b"tg")])
+    await safe_edit(event,
+        "🔁 تبچی تلگرام — روی هر اکانت بزن تا روشن/خاموش شه.\n"
+        "می‌تونی چندتا اکانت رو همزمان روشن کنی.", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"tgtab_(\\d+)"))
+async def tg_tabchi_toggle_cb(event):
+    if not is_owner(event):
+        return
+    acc = db.tg_get_account_by_id(int(event.pattern_match.group(1)))
+    if not acc:
+        await event.answer("پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    if phone in tg_tabchi_tasks:
+        await _tg_stop_tabchi(phone)
+        await event.answer("⏹ تبچیِ این اکانت خاموش شد.")
+        await tg_tabchi_cb(event)
+        return
+    # start: report group count first, then launch the concurrent loop
+    try:
+        client = await tg.get_client(phone)
+        groups = await tg.get_group_entities(client)
+    except Exception as e:  # noqa: BLE001
+        await event.answer(f"اتصال ناموفق: {repr(e)[:80]}", alert=True)
+        return
+    stt = {"stop": False, "sent": 0, "groups": len(groups), "pv": 0}
+    task = asyncio.create_task(_tg_run_tabchi(phone, stt))
+    tg_tabchi_tasks[phone] = {"task": task, "state": stt}
+    await log(card("✈️ TG تبچی — استارت", [
+        f"📱 {phone}", f"👥 گروه‌ها : {len(groups)}",
+        f"📝 متن‌ها : {len(db.tg_list_texts('tabchi'))}",
+        f"🕒 {now()}"]))
+    await _tg_ensure_stats_card()
+    await event.answer(f"🟢 تبچی روشن شد — {len(groups)} گروه.")
+    await tg_tabchi_cb(event)
+
+
+async def _tg_stop_tabchi(phone):
+    t = tg_tabchi_tasks.pop(phone, None)
+    if t:
+        t["state"]["stop"] = True
+        task = t.get("task")
+        if task and not task.done():
+            task.cancel()
+        await log(card("✈️ TG تبچی — توقف", [f"📱 {phone}",
+                       f"✉️ ارسالی این دور: {t['state'].get('sent', 0)}", f"🕒 {now()}"]))
+
+
+@bot.on(events.CallbackQuery(data=b"tgtaballoff"))
+async def tg_tabchi_alloff_cb(event):
+    if not is_owner(event):
+        return
+    for phone in list(tg_tabchi_tasks.keys()):
+        await _tg_stop_tabchi(phone)
+    await event.answer("⏹ همهٔ تبچی‌ها خاموش شدن.")
+    await tg_tabchi_cb(event)
 
 
 # --------------------------------------------------------------------------- #
