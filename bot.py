@@ -2029,24 +2029,77 @@ async def w_updall_cb(event):
     if not workers:
         await event.answer("ورکرِ ریموتِ فعالی برای آپدیت نیست.", alert=True)
         return
-    await safe_edit(event, f"⬆️ در حال آپدیتِ {len(workers)} ورکر (git pull + rebuild) ...")
+    chat_id = event.chat_id
+    await safe_edit(event,
+        f"⬆️ آپدیتِ {len(workers)} ورکر شروع شد (برنچ: {config.GIT_BRANCH}).\n"
+        "هر ورکر چند دقیقه build می‌شه؛ نتیجه‌ی هرکدوم جداگانه میاد. ⏳",
+        buttons=[[Button.inline("🔙 ورکرها", b"workers")]])
+    asyncio.create_task(_update_all_workers(chat_id, workers))
+
+
+async def _update_all_workers(chat_id, workers):
+    """Update every remote worker to config.GIT_BRANCH (checkout + rebuild +
+    rerun) and post a per-worker message as each one finishes — like the owner
+    bot. Uses worker.py's existing SSH primitives; no base file is modified.
+    The data volume is preserved, so the worker's logged-in sessions stay."""
     ok_n = 0
     fail_n = 0
-    lines = []
+    # explicitly SWITCH to the configured branch (plain `git pull` can't switch
+    # branches), rebuild the image, then recreate the container.
+    cmd = (
+        f"cd {worker.REMOTE_DIR} && git fetch origin && "
+        f"git checkout -B {config.GIT_BRANCH} origin/{config.GIT_BRANCH} && "
+        f"docker build --network=host -t {worker.IMAGE} . && "
+        f"docker rm -f {worker.CONTAINER} 2>/dev/null; "
+        f"docker run -d --name {worker.CONTAINER} --restart always "
+        f"--network=host --env-file {worker.REMOTE_DIR}/.env "
+        f"-v {worker.REMOTE_DATA}:/app/data {worker.IMAGE}"
+    )
     for w in workers:
+        tag = w.get("tag", "?")
+        ip = w.get("ip", "?")
+        try:
+            await bot.send_message(chat_id, f"⏳ در حال آپدیتِ {tag} • {ip} ...")
+        except Exception:
+            pass
         try:
             await worker.close_tunnel(w["id"])
-            await worker.update_worker(w)
-            ok_n += 1
-            lines.append(f"✅ {w['tag']} • {w['ip']}")
+        except Exception:
+            pass
+        try:
+            conn = await worker._with_conn(w)
+            try:
+                code, out, err = await worker._run(conn, cmd)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if code == 0:
+                ok_n += 1
+                msg = f"✅ {tag} • {ip} آپدیت شد (برنچ {config.GIT_BRANCH})."
+            else:
+                fail_n += 1
+                msg = f"❌ {tag} • {ip} ناموفق:\n{((err or out) or '')[-400:]}"
         except Exception as e:  # noqa: BLE001
             fail_n += 1
-            lines.append(f"❌ {w['tag']} • {w['ip']} — {repr(e)[:80]}")
-            await log_error("آپدیت ورکر", w.get("tag", "?"), "update_worker", e)
-    await log(card("⬆️ آپدیتِ همه‌ی ورکرها", lines + [LINE, f"✅ {ok_n}   ❌ {fail_n}", f"🕒 {now()}"]))
-    await safe_edit(event, card("⬆️ آپدیتِ همه‌ی ورکرها — پایان", [
-        f"✅ موفق : {ok_n}    ❌ ناموفق : {fail_n}", *lines,
-    ]), buttons=[[Button.inline("🔙 ورکرها", b"workers")]])
+            msg = f"❌ {tag} • {ip} خطا: {repr(e)[:200]}"
+        try:
+            await bot.send_message(chat_id, msg)
+        except Exception:
+            pass
+        try:
+            await log(msg)
+        except Exception:
+            pass
+    final = card("⬆️ آپدیتِ همه‌ی ورکرها — پایان", [
+        f"✅ موفق : {ok_n}    ❌ ناموفق : {fail_n}",
+        f"🕒 {now()}",
+    ])
+    try:
+        await bot.send_message(chat_id, final)
+    except Exception:
+        pass
 
 
 @bot.on(events.CallbackQuery(data=b"w_versions"))
