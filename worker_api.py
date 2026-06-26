@@ -72,6 +72,21 @@ def _qlog(text: str):
         del _extras_logs[:len(_extras_logs) - 500]
 
 
+def _worker_code_version() -> str:
+    """Short git revision of this worker's code (YoudonoaAx UPDATE, step 6),
+    reported via /health so the master can show a versions table. Best-effort."""
+    import os
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=10)
+        return (out.stdout or "").strip() or "—"
+    except Exception:  # noqa: BLE001
+        return "—"
+
+
 async def _worker_on_invalid(phone: str):
     _qlog(_wcard("🔐 INVALID_AUTH", [
         f"👤 Account : {phone}",
@@ -136,6 +151,7 @@ def _build_app():
         send_timeout: int = 60
         resume_wait: int = 300
         max_retries: int = 2
+        text2: str = ""          # step 5: optional Rubika second text (always text)
 
     class AutomationIn(BaseModel):
         phone: str
@@ -286,7 +302,7 @@ def _build_app():
                 file_ok = code in (200, 404)
         except Exception:
             file_ok = False
-        return {"file_ok": file_ok, "status_code": code}
+        return {"file_ok": file_ok, "status_code": code, "version": _worker_code_version()}
 
     # ----- login relay -----
     @app.post("/login/start")
@@ -1294,6 +1310,17 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                         rb.forward_message(client, saved_guid, guid, mid),
                         timeout=body.send_timeout,
                     )
+                    # step 5: optional second text (always text) to the SAME
+                    # recipient, right after the forward. Best-effort: a failure
+                    # of the second text must NOT undo the successful forward.
+                    if getattr(body, "text2", ""):
+                        try:
+                            await asyncio.wait_for(
+                                rb.send_text(client, guid, body.text2),
+                                timeout=body.send_timeout,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                     job["ok"] += 1
                     attempt_fail = 0          # reset: count CONSECUTIVE errors only
                 except Exception as e:  # noqa: BLE001

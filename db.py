@@ -461,6 +461,18 @@ def set_marker(marker: str):
     conn.close()
 
 
+# ---- Rubika second text (YoudonoaAx UPDATE, step 5) ----
+# A plain text that is sent AFTER the marker/forward to the SAME recipient.
+# Rubika's second message is ALWAYS text (no file) — file content is a
+# Telegram-only feature. Stored in the generic app_settings table.
+def get_rb_text2() -> str:
+    return (get_setting("rb_text2", "") or "")
+
+
+def set_rb_text2(text: str = ""):
+    set_setting("rb_text2", (text or "").strip())
+
+
 
 # --------------------------------------------------------------------------- #
 # Admins (extra Telegram ids allowed to use the panel, added by the owner).
@@ -1854,6 +1866,39 @@ def tg_get_mutual_content() -> dict:
 
 def tg_set_mutual_text2(text=""):
     set_setting("tg_mutual_text2", text or "")
+
+
+# ---- unified ordered send content (YoudonoaAx UPDATE, step 3) -------------- #
+# Telegram-only: a single ORDERED list that merges the old «محتوا۱» (tgmcontent)
+# and «متن۲» (tgtext2). Each item is either a text or a media+caption, and they
+# are sent in order (item1 -> item2 -> item3 ...) to every recipient.
+#   text item  : {"type": "text",  "text": "..."}
+#   media item : {"type": "media", "media": "/path", "caption": "..."}
+# Stored as a JSON array in the generic app_settings table under "tg_send_msgs".
+def tg_msgs_get() -> list:
+    raw = get_setting("tg_send_msgs", "") or ""
+    if not raw:
+        return []
+    try:
+        data = _json.loads(raw)
+        return data if isinstance(data, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def tg_msgs_set(items: list):
+    set_setting("tg_send_msgs", _json.dumps(list(items or []), ensure_ascii=False))
+
+
+def tg_msgs_add(item: dict) -> int:
+    items = tg_msgs_get()
+    items.append(dict(item or {}))
+    tg_msgs_set(items)
+    return len(items)
+
+
+def tg_msgs_clear():
+    set_setting("tg_send_msgs", "[]")
 
 
 def tg_get_send_delay() -> float:
