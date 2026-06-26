@@ -4416,23 +4416,28 @@ async def health_loop():
 TG_MEDIA_DIR = os.path.join(DATA_DIR, "tg_media")
 
 
-def _tg_media_path(event, prefix: str = "c") -> str:
+def _tg_media_path(event, prefix: str = "tg") -> str:
     """Build a download path that PRESERVES the real file name + extension.
 
     YoudonoaAx UPDATE (step 4): media used to be saved as ``c_<timestamp>``
-    which destroyed the original name/extension, so the forwarded file lost its
-    true name/type. We now keep the real ``event.file.name`` (sanitised to its
-    basename so it can never escape TG_MEDIA_DIR), and only fall back to a
-    timestamp name when Telegram gives us no file name."""
+    which destroyed the original name/extension. We now keep the real
+    ``event.file.name`` (sanitised to its basename so it can never escape
+    TG_MEDIA_DIR). For media that genuinely has NO name (photos / voice /
+    stickers), Telegram gives us no filename, so we build a sensible name WITH
+    the correct extension (e.g. ``tg_<ts>.jpg``) instead of a bare number."""
     real = ""
+    ext = ""
     try:
-        real = getattr(getattr(event, "file", None), "name", None) or ""
+        f = getattr(event, "file", None)
+        real = getattr(f, "name", None) or ""
+        ext = getattr(f, "ext", None) or ""
     except Exception:  # noqa: BLE001
-        real = ""
+        real, ext = "", ""
     real = os.path.basename(real).strip()
     if real:
         return os.path.join(TG_MEDIA_DIR, f"{int(time.time())}_{real}")
-    return os.path.join(TG_MEDIA_DIR, f"{prefix}_{int(time.time())}")
+    safe_ext = ext if ext.startswith(".") else (("." + ext) if ext else "")
+    return os.path.join(TG_MEDIA_DIR, f"{prefix}_{int(time.time())}{safe_ext}")
 
 
 def _tg_typing_secs() -> float:
@@ -4917,12 +4922,13 @@ async def _tg_run_mutual(owner_id, acc):
                     else:
                         # fallback: per-recipient upload if the Saved copy failed
                         await tg.send_media(client, u, p["path"], p["caption"],
-                                            typing=_tg_typing_secs())
+                                            typing=0)   # no typing delay = faster
                     db.tg_incr_sent(phone, 1)
                 elif p["text"]:
-                    await tg.send_text(client, u, p["text"], typing=_tg_typing_secs())
+                    await tg.send_text(client, u, p["text"], typing=0)  # faster
                     db.tg_incr_sent(phone, 1)
-                await asyncio.sleep(0.3)   # small gap between items
+                if len(prepared) > 1:
+                    await asyncio.sleep(0.05)   # tiny gap only when multi-item
             ctl["ok"] += 1
             db.tg_mark_sent(uid)
         except Exception as e:  # noqa: BLE001
