@@ -152,6 +152,7 @@ def _build_app():
         resume_wait: int = 300
         max_retries: int = 2
         text2: str = ""          # step 5: optional Rubika second text (always text)
+        recipients: list = []    # resume fix: explicit remaining list (frozen order)
 
     class AutomationIn(BaseModel):
         phone: str
@@ -422,8 +423,15 @@ def _build_app():
             except Exception:
                 pass
             return {"ok": False, "marker_found": False, "total": 0}
-        ordered, _stats = await rb.get_ordered_recipients(client)
-        recipients = [r["guid"] for r in ordered]
+        # YoudonoaAx UPDATE (resume fix): if the master supplies an explicit
+        # recipient list (a resume / worker-transfer of the REMAINING list),
+        # send EXACTLY that list in the given order. Otherwise build the full
+        # ordered list as before.
+        if getattr(body, "recipients", None):
+            recipients = list(body.recipients)
+        else:
+            ordered, _stats = await rb.get_ordered_recipients(client)
+            recipients = [r["guid"] for r in ordered]
 
         job_id = uuid.uuid4().hex[:12]
         job = {"phone": body.phone, "total": len(recipients), "ok": 0, "fail": 0,
@@ -431,8 +439,10 @@ def _build_app():
                "retry_count": 0, "state": "sending"}
         _jobs[job_id] = job
         asyncio.create_task(_run_send(client, job, saved_guid, mid, recipients, body))
+        # return the EXACT ordered guids so the master can mirror the list and
+        # compute the remaining slice (guids[ok+fail:]) for a precise resume.
         return {"ok": True, "marker_found": True, "job_id": job_id,
-                "total": len(recipients)}
+                "total": len(recipients), "guids": recipients}
 
     @app.get("/send/status/{job_id}")
     async def send_status(job_id: str, authorization: str = Header(None)):

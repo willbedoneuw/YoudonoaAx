@@ -2375,6 +2375,11 @@ async def run_send_remote(owner_id: int, payload: dict):
     delay = db.get_delay()
     count = _next_counter()
     total = payload.get("total", 0)
+    # resume fix: an explicit remaining list means this run is a resume /
+    # worker-transfer (full engine, same as a normal send).
+    explicit_recipients = payload.get("recipients") or None
+    is_resume = bool(payload.get("is_resume") or explicit_recipients)
+    guids = list(explicit_recipients) if explicit_recipients else []
     ok = 0
     fail = 0
     reason = None
@@ -2386,16 +2391,27 @@ async def run_send_remote(owner_id: int, payload: dict):
         return
 
     active_jobs.add(account_id)
-    await log(card("SEND STARTED 🚀", [
-        f"🛠 Count : {count:03d}",
-        f"📱 Phone : {phone}",
-        f"👨‍🔧 Worker : {w['tag']}",
-        f"🕒 Started : {now()}",
-        LINE,
-        f"🎯 Targets : {total}",
-        f"⏱ Delay : {delay}s",
-        f"📌 Marker : «{marker}» Found ✅",
-    ]))
+    if is_resume:
+        await log(card("🔁 ادامه شروع شد", [
+            f"🛠 Count : {count:03d}",
+            f"📱 Phone : {phone}",
+            f"👨‍🔧 Worker : {w['tag']}",
+            f"🕒 {now()}",
+            LINE,
+            f"⏳ باقی‌مونده برای ارسال : {len(explicit_recipients or [])}",
+            f"⏱ Delay : {delay}s",
+        ]))
+    else:
+        await log(card("SEND STARTED 🚀", [
+            f"🛠 Count : {count:03d}",
+            f"📱 Phone : {phone}",
+            f"👨‍🔧 Worker : {w['tag']}",
+            f"🕒 Started : {now()}",
+            LINE,
+            f"🎯 Targets : {total}",
+            f"⏱ Delay : {delay}s",
+            f"📌 Marker : «{marker}» Found ✅",
+        ]))
 
     prev_retry = 0
     last_log_mark = 0
@@ -2406,12 +2422,16 @@ async def run_send_remote(owner_id: int, payload: dict):
             "resume_wait": db.get_resume_wait(),
             "max_retries": 0 if config.RESUME_UNLIMITED else config.RESUME_MAX_RETRIES,
             "text2": db.get_rb_text2(),   # step 5: optional Rubika second text
+            "recipients": explicit_recipients or [],  # resume fix: remaining list
         })
         if not res.get("ok") or not res.get("marker_found"):
             reason = "مارکر روی ورکر پیدا نشد"
         else:
             job_id = res["job_id"]
             total = res.get("total", total)
+            # mirror the EXACT ordered list the worker is using, so we can
+            # compute the precise remaining slice (guids[ok+fail:]) on stop.
+            guids = res.get("guids") or guids
             while True:
                 if stop_flags.get(account_id):
                     try:
@@ -2469,7 +2489,7 @@ async def run_send_remote(owner_id: int, payload: dict):
     is_owner_user = owner_id == config.OWNER_ID
 
     if reason:
-        await log(card("⛔ SEND STOPPED", [
+        await log(card("🔁 ادامه متوقف شد ⛔" if is_resume else "⛔ SEND STOPPED", [
             f"👤 Account : {phone}",
             f"👨‍🔧 Worker : {w['tag']}",
             f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
@@ -2482,16 +2502,23 @@ async def run_send_remote(owner_id: int, payload: dict):
                                    buttons=main_menu(is_owner_user))
         except Exception:
             pass
-        # update_end #5 (remote): when a worker send ENDS, also offer the
-        # check-account -> confirm/worker-transfer -> continue panel.
+        # resume fix: pass the REAL remaining list (guids[ok+fail:]) so the
+        # resume / worker-transfer continues from where it stopped — not from
+        # scratch. (ok+fail == processed index on the worker.)
+        remaining = guids[(ok + fail):] if guids else []
         await _offer_resume_after_send(owner_id, {
             "account_id": account_id, "phone": phone, "remote": True,
-            "worker_id": w["id"], "recipients": [], "base_ok": ok, "tag": "",
+            "worker_id": w["id"], "recipients": remaining, "base_ok": ok, "tag": "",
             "dead": ("blocked" in str(reason)) or ("باطل" in str(reason)),
             "reason": reason,
         })
     else:
-        await log(card("SEND FINISHED ✅", [
+        # fully finished -> nothing remaining; clear any stale paused record.
+        try:
+            db.delete_paused_send(account_id)
+        except Exception:
+            pass
+        await log(card("🔁 ادامه تمام شد ✅" if is_resume else "SEND FINISHED ✅", [
             "🟢 Status : Completed",
             f"👤 Account : {phone}",
             f"👨‍🔧 Worker : {w['tag']}",
@@ -5082,6 +5109,7 @@ async def _offer_resume_after_send(owner_id: int, info: dict):
         body.append("برای ادامه، «🔁 لاگین به ورکر جدید و ادامه» رو بزن.")
         rows.append([Button.inline("🔁 لاگین به ورکر جدید و ادامه",
                                    f"rlogin_{account_id}".encode())])
+        rows.append([Button.inline("🚫 لغو ادامه", f"rcancel_{account_id}".encode())])
     rows.append([Button.inline("🏠 منوی اصلی", b"home")])
     panel = card("🔄 پایان ارسال — انتقال/ادامه", body)
     try:
@@ -5102,6 +5130,20 @@ async def resume_continue_cb(event):
     aid = int(event.pattern_match.group(1))
     await safe_edit(event, "▶️ ادامه‌ی ارسال از لیست باقی‌مونده ...")
     await _do_resume(event.sender_id, aid)
+
+
+@bot.on(events.CallbackQuery(pattern=b"rcancel_(\\d+)"))
+async def resume_cancel_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    # R9: discard the paused/remaining list so it won't be offered again.
+    try:
+        db.delete_paused_send(aid)
+    except Exception:
+        pass
+    await safe_edit(event, "🚫 ادامه لغو شد و لیستِ باقی‌مونده پاک شد.",
+                    buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
 
 
 @bot.on(events.CallbackQuery(pattern=b"rlogin_(\\d+)"))
@@ -5156,6 +5198,15 @@ async def _maybe_resume_after_login(owner_id: int, phone: str):
             aid = a["id"]
             break
     if aid is not None:
+        # R3: a successful login on the NEW worker (after a transfer) is logged
+        # to the log group before continuing the remaining list.
+        acc = db.get_account(aid)
+        w = worker.worker_for_account(acc) if acc else None
+        await log(card("✅ لاگینِ ورکرِ جدید موفق بود — ادامه می‌زنه", [
+            f"📱 {phone}",
+            f"👨‍🔧 ورکرِ جدید : {w['tag'] if w else '—'}",
+            f"🕒 {now()}",
+        ]))
         await _do_resume(owner_id, aid)
 
 
@@ -5190,15 +5241,21 @@ async def _do_resume(owner_id: int, account_id: int):
         asyncio.create_task(run_send(owner_id, payload))
         return
 
-    # 2) exact list known but the account is now on a REMOTE worker (transfer)
-    #    -> forward exactly those guids on the worker via /send/to_list
+    # 2) exact list known + account is now on a REMOTE worker (e.g. after a
+    #    worker transfer) -> continue with the FULL send engine on that worker
+    #    (same progress / auto-resume / repeatable-transfer as a normal send),
+    #    sending EXACTLY the remaining guids — not the whole list again.
     if recips and is_remote_now:
         try:
             await bot.send_message(owner_id,
                 f"▶️ ادامه‌ی لیست روی ورکر «{w['tag']}» ({len(recips)} گیرنده) ...")
         except Exception:
             pass
-        asyncio.create_task(_resume_remote_list(owner_id, account_id, recips))
+        asyncio.create_task(run_send_remote(owner_id, {
+            "account_id": account_id, "phone": rec["phone"], "remote": True,
+            "worker_id": w["id"], "total": len(recips),
+            "recipients": recips, "is_resume": True,
+        }))
         return
 
     # 3) remote (no precise list) -> fresh send routed by the current worker
