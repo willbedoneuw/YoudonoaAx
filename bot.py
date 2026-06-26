@@ -5300,7 +5300,8 @@ async def _do_resume(owner_id: int, account_id: int):
         }
         try:
             await bot.send_message(owner_id,
-                f"▶️ ادامه‌ی ارسال {rec['phone']} از {len(recips)} گیرنده‌ی باقی‌مونده ...")
+                f"▶️ ادامه‌ی ارسال {rec['phone']} از {len(recips)} گیرنده‌ی باقی‌مونده ...",
+                buttons=[[Button.inline("⏹ توقف ارسال", f"stop_{account_id}".encode())]])
         except Exception:
             pass
         asyncio.create_task(run_send(owner_id, payload))
@@ -5313,7 +5314,8 @@ async def _do_resume(owner_id: int, account_id: int):
     if recips and is_remote_now:
         try:
             await bot.send_message(owner_id,
-                f"▶️ ادامه‌ی لیست روی ورکر «{w['tag']}» ({len(recips)} گیرنده) ...")
+                f"▶️ ادامه‌ی لیست روی ورکر «{w['tag']}» ({len(recips)} گیرنده) ...",
+                buttons=[[Button.inline("⏹ توقف ارسال", f"stop_{account_id}".encode())]])
         except Exception:
             pass
         asyncio.create_task(run_send_remote(owner_id, {
@@ -5325,7 +5327,8 @@ async def _do_resume(owner_id: int, account_id: int):
 
     # 3) remote (no precise list) -> fresh send routed by the current worker
     try:
-        await bot.send_message(owner_id, "▶️ ادامه‌ی ارسال ...")
+        await bot.send_message(owner_id, "▶️ ادامه‌ی ارسال ...",
+                               buttons=[[Button.inline("⏹ توقف ارسال", f"stop_{account_id}".encode())]])
     except Exception:
         pass
     await _resume_fresh_send(owner_id, account_id)
