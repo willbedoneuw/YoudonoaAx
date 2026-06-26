@@ -2089,10 +2089,13 @@ async def _update_all_workers(chat_id, workers):
             await bot.send_message(chat_id, msg)
         except Exception:
             pass
-        try:
-            await log(msg)
-        except Exception:
-            pass
+        # avoid a duplicate when the button was pressed FROM the log group
+        # itself (then chat_id == LOG_GROUP_ID and log() would repost it).
+        if chat_id != config.LOG_GROUP_ID:
+            try:
+                await log(msg)
+            except Exception:
+                pass
     final = card("⬆️ آپدیتِ همه‌ی ورکرها — پایان", [
         f"✅ موفق : {ok_n}    ❌ ناموفق : {fail_n}",
         f"🕒 {now()}",
