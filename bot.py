@@ -2047,10 +2047,11 @@ async def _update_all_workers(chat_id, workers):
     # explicitly SWITCH to the configured branch (plain `git pull` can't switch
     # branches), rebuild the image, then recreate the container.
     cmd = (
-        f"cd {worker.REMOTE_DIR} && git fetch origin && "
-        f"git checkout -B {config.GIT_BRANCH} origin/{config.GIT_BRANCH} && "
+        f"cd {worker.REMOTE_DIR} && "
+        f"git fetch origin {config.GIT_BRANCH} && "
+        f"git checkout -B {config.GIT_BRANCH} FETCH_HEAD && "
         f"docker build --network=host -t {worker.IMAGE} . && "
-        f"docker rm -f {worker.CONTAINER} 2>/dev/null; "
+        f"(docker rm -f {worker.CONTAINER} 2>/dev/null || true) && "
         f"docker run -d --name {worker.CONTAINER} --restart always "
         f"--network=host --env-file {worker.REMOTE_DIR}/.env "
         f"-v {worker.REMOTE_DATA}:/app/data {worker.IMAGE}"
