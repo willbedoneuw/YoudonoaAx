@@ -4417,14 +4417,13 @@ TG_MEDIA_DIR = os.path.join(DATA_DIR, "tg_media")
 
 
 def _tg_media_path(event, prefix: str = "tg") -> str:
-    """Build a download path that PRESERVES the real file name + extension.
+    """Build a download path that keeps the EXACT real file name + extension.
 
-    YoudonoaAx UPDATE (step 4): media used to be saved as ``c_<timestamp>``
-    which destroyed the original name/extension. We now keep the real
-    ``event.file.name`` (sanitised to its basename so it can never escape
-    TG_MEDIA_DIR). For media that genuinely has NO name (photos / voice /
-    stickers), Telegram gives us no filename, so we build a sensible name WITH
-    the correct extension (e.g. ``tg_<ts>.jpg``) instead of a bare number."""
+    YoudonoaAx UPDATE (step 4): each file goes into its OWN unique sub-folder,
+    so the file itself keeps its EXACT original name (e.g. ``myfile.zip``) with
+    NO timestamp prefix, while collisions are still avoided by the unique
+    folder. Media that genuinely has no name (photos / voice) gets a sensible
+    name WITH the correct extension."""
     real = ""
     ext = ""
     try:
@@ -4434,10 +4433,11 @@ def _tg_media_path(event, prefix: str = "tg") -> str:
     except Exception:  # noqa: BLE001
         real, ext = "", ""
     real = os.path.basename(real).strip()
+    sub = os.path.join(TG_MEDIA_DIR, str(int(time.time() * 1000)))  # unique folder
     if real:
-        return os.path.join(TG_MEDIA_DIR, f"{int(time.time())}_{real}")
+        return os.path.join(sub, real)
     safe_ext = ext if ext.startswith(".") else (("." + ext) if ext else "")
-    return os.path.join(TG_MEDIA_DIR, f"{prefix}_{int(time.time())}{safe_ext}")
+    return os.path.join(sub, f"{prefix}_{int(time.time())}{safe_ext}")
 
 
 def _tg_typing_secs() -> float:
@@ -4750,8 +4750,10 @@ async def handle_tg_msg_media(event):
                             buttons=[[Button.inline("📨 محتوای ارسال", b"tgmsgs")]])
         return
     os.makedirs(TG_MEDIA_DIR, exist_ok=True)
+    dl_path = _tg_media_path(event, "c")
+    os.makedirs(os.path.dirname(dl_path), exist_ok=True)   # unique per-file folder
     try:
-        path = await event.download_media(file=_tg_media_path(event, "c"))
+        path = await event.download_media(file=dl_path)
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ دانلودِ فایل ناموفق: {repr(e)[:120]}")
         return
