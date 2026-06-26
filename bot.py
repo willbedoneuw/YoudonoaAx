@@ -4516,6 +4516,7 @@ async def tg_account_menu_cb(event):
         [Button.inline("📤 ارسال به مخاطبین", f"tgrun_{rid}".encode())],
         [Button.inline("📨 محتوای ارسال", b"tgmsgs"),
          Button.inline("⏱ سرعت ارسال", b"tgspeed")],
+        [Button.inline("🔄 ریستِ ارسال‌شده‌ها (ارسال مجدد به همه)", b"tgdedup")],
         [Button.inline("🗑 حذف اکانت", f"tgdel_{rid}".encode()),
          Button.inline("🔙 پنل تلگرام", b"tg")],
     ]
@@ -4556,6 +4557,35 @@ async def tg_delete_cb(event):
     db.tg_delete_account(phone)
     await event.answer("حذف شد.")
     await tg_menu_cb(event)
+
+
+# ----- dedup reset: re-send to everyone again (YoudonoaAx UPDATE) ----------- #
+@bot.on(events.CallbackQuery(data=b"tgdedup"))
+async def tg_dedup_cb(event):
+    if not is_owner(event):
+        return
+    n = db.tg_dedup_count()
+    await safe_edit(event, card("🔄 ریستِ لیستِ ارسال‌شده‌ها", [
+        f"الان {n} مخاطب به‌عنوان «قبلاً فرستاده‌شده» علامت خورده‌ن و در ارسالِ بعدی رد می‌شن.",
+        "اگه می‌خوای محتوای جدید رو دوباره به همه بفرستی، این لیست رو پاک کن.",
+        "⚠️ این کار برگشت‌ناپذیره (ولی هیچ اکانت/محتوایی رو حذف نمی‌کنه).",
+    ]), buttons=[
+        [Button.inline("✅ پاک کن و بذار به همه دوباره بفرستم", b"tgdedupyes")],
+        [Button.inline("🔙 انصراف", b"tg")],
+    ])
+
+
+@bot.on(events.CallbackQuery(data=b"tgdedupyes"))
+async def tg_dedup_yes_cb(event):
+    if not is_owner(event):
+        return
+    n = db.tg_dedup_count()
+    db.tg_clear_dedup()
+    await log(card("🔄 لیستِ ارسال‌شده‌های تلگرام پاک شد", [
+        f"🗑 {n} مخاطب از حالتِ «تکراری» خارج شدن.", f"🕒 {now()}"]))
+    await safe_edit(event, card("✅ انجام شد", [
+        f"{n} مخاطب پاک شد. حالا ارسالِ بعدی دوباره به همه می‌ره.",
+    ]), buttons=[[Button.inline("🔙 پنل تلگرام", b"tg")]])
 
 
 # ----- unified ordered send content (YoudonoaAx UPDATE, step 3) ------------- #

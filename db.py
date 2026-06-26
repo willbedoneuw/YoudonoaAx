@@ -1938,6 +1938,24 @@ def tg_mark_sent(user_id):
     conn.close()
 
 
+# ---- dedup reset (YoudonoaAx UPDATE) -------------------------------------- #
+# The "already sent" notebook is global+permanent (keyed by user_id). Clearing
+# it lets the owner deliberately re-send to EVERYONE again (e.g. after changing
+# the send content). Returns how many entries existed before clearing.
+def tg_dedup_count() -> int:
+    conn = _conn()
+    n = conn.execute("SELECT COUNT(*) FROM tg_dedup").fetchone()[0]
+    conn.close()
+    return int(n or 0)
+
+
+def tg_clear_dedup():
+    conn = _conn()
+    conn.execute("DELETE FROM tg_dedup")
+    conn.commit()
+    conn.close()
+
+
 
 # =========================================================================== #
 # YoudonoaAx — Telegram engines (join / comment / sniper / secretary) helpers.
