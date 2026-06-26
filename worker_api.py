@@ -76,15 +76,44 @@ def _worker_code_version() -> str:
     """Short git revision of this worker's code (YoudonoaAx UPDATE, step 6),
     reported via /health so the master can show a versions table. Best-effort."""
     import os
-    import subprocess
+    base = os.path.dirname(os.path.abspath(__file__))
+    # 1) the git binary (works on the master/host where git is installed)
     try:
+        import subprocess
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True, text=True, timeout=10)
-        return (out.stdout or "").strip() or "—"
+            cwd=base, capture_output=True, text=True, timeout=10)
+        rev = (out.stdout or "").strip()
+        if rev:
+            return rev
     except Exception:  # noqa: BLE001
-        return "—"
+        pass
+    # 2) inside the Docker worker `git` is NOT installed, but the `.git` dir IS
+    #    copied into the image — so read the commit straight from .git (no binary).
+    try:
+        git_dir = os.path.join(base, ".git")
+        head = open(os.path.join(git_dir, "HEAD"), encoding="utf-8").read().strip()
+        if head.startswith("ref:"):
+            ref = head.split(":", 1)[1].strip()
+            ref_path = os.path.join(git_dir, ref)
+            sha = ""
+            if os.path.exists(ref_path):
+                sha = open(ref_path, encoding="utf-8").read().strip()
+            else:                                   # packed-refs fallback
+                pr = os.path.join(git_dir, "packed-refs")
+                if os.path.exists(pr):
+                    for line in open(pr, encoding="utf-8"):
+                        line = line.strip()
+                        if line and not line.startswith(("#", "^")) and line.endswith(ref):
+                            sha = line.split(" ", 1)[0]
+                            break
+        else:
+            sha = head                              # detached HEAD = raw sha
+        if sha:
+            return sha[:7]
+    except Exception:  # noqa: BLE001
+        pass
+    return "—"
 
 
 async def _worker_on_invalid(phone: str):
