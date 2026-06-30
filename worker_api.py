@@ -199,6 +199,13 @@ def _build_app():
     class PhoneIn(BaseModel):
         phone: str
 
+    class SessionImportIn(BaseModel):
+        phone: str
+        auth: str = None
+        private_key: str = None
+        guid: str = None
+        user_agent: str = None
+
     class GroupLeaveIn(BaseModel):
         phone: str
         group_guid: str
@@ -370,7 +377,12 @@ def _build_app():
             _ordered, stats = await rb.get_ordered_recipients(client)
             return {"ok": True, "name": name, "guid": str(guid),
                     "contacts": stats["contacts"], "groups": stats["groups"],
-                    "with_chat": stats["with_chat"], "phone": ctx["phone"]}
+                    "with_chat": stats["with_chat"], "phone": ctx["phone"],
+                    # v4: portable session values so the master can store the
+                    # session and re-import it onto any worker WITHOUT a code.
+                    "auth": getattr(client, "auth", None),
+                    "private_key": getattr(client, "private_key", None),
+                    "user_agent": getattr(client, "user_agent", None)}
         finally:
             try:
                 await client.disconnect()
@@ -693,6 +705,35 @@ def _build_app():
         _auth(authorization)
         dead = await account_conn.verify_session_dead(body.phone)
         return {"ok": True, "dead": bool(dead)}
+
+    @app.post("/session/import")
+    async def session_import(body: SessionImportIn, authorization: str = Header(None)):
+        _auth(authorization)
+        # v4: WRITE the portable session onto this worker's local session store
+        # WITHOUT connecting. session.insert only writes the session file, so it
+        # can NEVER cause AUTH_FROM_ANOTHER (no second live connection). The
+        # account connects later only when a real job runs (coordinated by
+        # account_conn / active_jobs — single connection at a time).
+        if not body.auth:
+            return {"ok": False, "error": "missing auth"}
+        try:
+            phone = rb.normalize_phone(body.phone)
+            # make sure no warm connection is fighting the file (Feature 6)
+            try:
+                await account_conn.close(phone)
+            except Exception:
+                pass
+            client = rb.open_client(phone)
+            client.session.insert(
+                auth=body.auth,
+                guid=body.guid,
+                user_agent=body.user_agent,
+                phone_number=phone,
+                private_key=body.private_key,
+            )
+            return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": repr(e)[:200]}
 
     @app.post("/group/leave")
     async def group_leave(body: GroupLeaveIn, authorization: str = Header(None)):

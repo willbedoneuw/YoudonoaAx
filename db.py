@@ -5,6 +5,8 @@ No proxy tables, no broadcast queues — this is a small personal tool.
 """
 import os
 import sqlite3
+import json
+import base64
 from datetime import datetime
 
 import config
@@ -361,6 +363,9 @@ def init():
     cols = [r["name"] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
     if "worker_id" not in cols:
         c.execute("ALTER TABLE accounts ADD COLUMN worker_id INTEGER")
+    # ---- migration (v4): portable Rubika session blob (encrypted at rest) ----
+    if "session_blob" not in cols:
+        c.execute("ALTER TABLE accounts ADD COLUMN session_blob TEXT")
 
     conn.commit()
     conn.close()
@@ -425,6 +430,73 @@ def set_status(account_id: int, status: str):
     conn.execute("UPDATE accounts SET status = ? WHERE id = ?", (status, account_id))
     conn.commit()
     conn.close()
+
+
+# ---------- portable Rubika session (v4) ----------
+# A Rubika session = 5 values (auth, private_key, guid, phone, user_agent).
+# We can rebuild the connection from these on ANY server WITHOUT a login code
+# (this is exactly how the workers reconnect). These helpers (a) pack the 5
+# values into one copyable string for the log group / transfer, and (b) store
+# them ENCRYPTED at rest in the accounts table.
+_SESSION_PREFIX = "YDSESS:"
+
+
+def session_pack(values: dict) -> str:
+    """Pack the 5 session values into ONE copyable token (base64 of JSON)."""
+    raw = json.dumps(values or {}, separators=(",", ":")).encode()
+    return _SESSION_PREFIX + base64.urlsafe_b64encode(raw).decode()
+
+
+def session_unpack(token: str) -> dict:
+    """Parse a YDSESS token (or a bare base64/JSON) back into the values dict."""
+    token = (token or "").strip()
+    if token.startswith(_SESSION_PREFIX):
+        token = token[len(_SESSION_PREFIX):]
+    token = token.strip()
+    # try base64 first, then raw JSON
+    try:
+        raw = base64.urlsafe_b64decode(token.encode())
+        return json.loads(raw.decode())
+    except Exception:
+        return json.loads(token)
+
+
+def set_session_blob(account_id: int, values: dict):
+    """Store the 5-value session, ENCRYPTED at rest when WORKER_SECRET is set
+    (falls back to the obfuscated token so the feature still works)."""
+    try:
+        import crypto_util
+        blob = crypto_util.encrypt(json.dumps(values or {}))
+    except Exception:
+        blob = session_pack(values or {})
+    conn = _conn()
+    conn.execute("UPDATE accounts SET session_blob = ? WHERE id = ?",
+                 (blob, account_id))
+    conn.commit()
+    conn.close()
+
+
+def get_session_blob(account_id: int):
+    """Return the stored session values dict, or None. Reads either the
+    encrypted blob or the obfuscated/plain token (whatever was stored)."""
+    conn = _conn()
+    row = conn.execute("SELECT session_blob FROM accounts WHERE id = ?",
+                       (account_id,)).fetchone()
+    conn.close()
+    if not row or not row["session_blob"]:
+        return None
+    blob = row["session_blob"]
+    # 1) encrypted (normal path)
+    try:
+        import crypto_util
+        return json.loads(crypto_util.decrypt(blob))
+    except Exception:
+        pass
+    # 2) obfuscated/plain token fallback
+    try:
+        return session_unpack(blob)
+    except Exception:
+        return None
 
 
 # ---------- settings ----------
