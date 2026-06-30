@@ -5717,7 +5717,8 @@ async def _resume_remote_list(owner_id, account_id, guids):
         res = await worker.api_call(w, "POST", "/send/to_list", {
             "phone": acc["phone"], "marker": marker, "guids": guids,
             "delay": db.get_delay(), "max_errors": db.get_max_errors(),
-            "send_timeout": config.SEND_TIMEOUT}, timeout=14400)
+            "send_timeout": config.SEND_TIMEOUT,
+            "text2": db.get_rb_text2()}, timeout=14400)
         ok = res.get("sent", 0)
         fail = res.get("fail", 0)
         await log(card("✅ ادامه‌ی ارسال (ورکر) تمام شد", [
@@ -6273,7 +6274,7 @@ async def _send_to_guids(owner_id, acc, guids, mode, text, tag=""):
         res = await worker.api_call(w, "POST", "/send/to_list", {
             "phone": phone, "marker": marker, "guids": guids, "delay": delay,
             "max_errors": db.get_max_errors(), "send_timeout": config.SEND_TIMEOUT,
-            "mode": mode, "text": text}, timeout=14400)
+            "mode": mode, "text": text, "text2": db.get_rb_text2()}, timeout=14400)
         if not res.get("ok"):
             raise RuntimeError(res.get("error", "send failed"))
         return res.get("sent", 0), res.get("fail", 0)
@@ -6995,7 +6996,8 @@ async def _run_brain_send(owner_id, job):
                 res = await worker.api_call(w, "POST", "/send/to_list", {
                     "phone": phone, "marker": marker, "guids": guids,
                     "delay": delay, "max_errors": db.get_max_errors(),
-                    "send_timeout": config.SEND_TIMEOUT}, timeout=14400)
+                    "send_timeout": config.SEND_TIMEOUT,
+                    "text2": db.get_rb_text2()}, timeout=14400)
                 if not res.get("ok"):
                     raise RuntimeError(res.get("error", "send failed"))
                 await log(card("🧠 ارسال — پایان اکانت (ورکر)", [
