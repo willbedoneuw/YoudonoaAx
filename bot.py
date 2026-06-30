@@ -304,6 +304,50 @@ async def _distribute_session(values, only_worker_id=None):
     return ok, fail
 
 
+async def _session_transfer_to_worker(neww, sess, phone) -> bool:
+    """Code-free worker transfer: WRITE the stored session onto the chosen
+    worker and verify it's alive. Returns True on success. Write-only on remote
+    (no connect) so it can't cause AUTH_FROM_ANOTHER; the real connection happens
+    later in the resume send (one connection at a time — conflict logic intact)."""
+    try:
+        if worker.is_local(neww):
+            try:
+                await account_conn.close(phone)
+            except Exception:
+                pass
+            client = rb.open_client(phone)
+            client.session.insert(
+                auth=sess.get("auth"), guid=sess.get("guid"),
+                user_agent=sess.get("user_agent"),
+                phone_number=rb.normalize_phone(phone),
+                private_key=sess.get("private_key"))
+            ok = False
+            try:
+                await rb.connect_ready(client)
+                me = await client.get_me()
+                ok = bool(rb._guid_of(me))
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            return ok
+        # remote: write-only import, then verify (no second live connection)
+        res = await _push_session_to_worker(neww, sess)
+        if not res.get("ok"):
+            return False
+        vr = await worker.api_call(neww, "POST", "/account/verify",
+                                   {"phone": rb.normalize_phone(phone)}, timeout=90)
+        return not vr.get("dead")
+    except Exception as e:  # noqa: BLE001
+        try:
+            await log(card("⚠️ WORKER TRANSFER (سشن) ناموفق", [
+                f"📱 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+        except Exception:
+            pass
+        return False
+
+
 async def _log_invalid_auth(phone: str, detail: str = ""):
     """Log that an account's session is truly invalid (device kicked out / login
     revoked) AFTER a fresh-connection retry already failed. Per the owner this is
@@ -5544,6 +5588,30 @@ async def resume_relogin_cb(event):
                      [Button.inline("🛠 افزودن ورکر", b"wk_add")],
                      [Button.inline("🔙 بازگشت", b"home")]])
         return
+    # v4: try a CODE-FREE worker transfer first, using the stored session.
+    # Import is write-only on the new worker; the real connection happens only
+    # later in the resume send (one at a time) — session conflict logic intact.
+    sess = None
+    try:
+        sess = db.get_session_blob(aid)
+    except Exception:
+        sess = None
+    if sess and sess.get("auth"):
+        sess["phone"] = rb.normalize_phone(phone)
+        await safe_edit(event, f"🔁 انتقال به «{neww['tag']}» با سشن (بدون کد) ...")
+        if await _session_transfer_to_worker(neww, sess, phone):
+            db.set_account_worker(aid, neww["id"])
+            await log(card("🔁 WORKER TRANSFER — با سشن (بدون کد)", [
+                f"📱 {phone}", f"👨‍🔧 ورکرِ جدید : {neww['tag']}",
+                "✅ بدون کد وصل شد — ادامه‌ی لیست", f"🕒 {now()}"]))
+            await safe_edit(event,
+                f"✅ با سشن روی «{neww['tag']}» وصل شد (بدون کد). ادامه‌ی لیست ...")
+            await _do_resume(event.sender_id, aid)
+            return
+        await safe_edit(event,
+            f"⚠️ لاگین با سشن روی «{neww['tag']}» نشد — می‌ریم سراغِ کدِ دستی.")
+    # fallback: manual code-based login (original behavior, conflict logic
+    # untouched). _maybe_resume_after_login continues the list after login.
     pending_resume_after_login[event.sender_id] = phone
     await safe_edit(event,
         f"🔁 انتقال به ورکر «{neww['tag']}» و لاگین مجدد {phone} — شماره/کد رو می‌گیرم، "
