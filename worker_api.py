@@ -267,6 +267,7 @@ def _build_app():
         send_timeout: int = 60
         mode: str = "marker"      # 'marker' (forward) or 'text' (send_text)
         text: str = ""
+        text2: str = ""          # step 5: optional Rubika second text (always text)
 
     class LinkdooniIn(BaseModel):
         phone: str
@@ -928,6 +929,16 @@ def _build_app():
                         await asyncio.wait_for(
                             rb.forward_message(client, saved_guid, g, mid),
                             timeout=body.send_timeout)
+                    # step 5: optional second text (always text) to the SAME
+                    # recipient right after the main send — mirrors the local
+                    # run_send. Best-effort: a failure must NOT undo the send.
+                    if getattr(body, "text2", ""):
+                        try:
+                            await asyncio.wait_for(
+                                rb.send_text(client, g, body.text2),
+                                timeout=body.send_timeout)
+                        except Exception:  # noqa: BLE001
+                            pass
                     ok += 1
                     attempt_fail = 0
                 except Exception:
