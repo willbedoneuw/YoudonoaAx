@@ -222,6 +222,88 @@ async def log_error(section: str, account: str, operation: str, error,
     await log(card("⚠️ خطا", rows))
 
 
+# --------------------------------------------------------------------------- #
+# Portable Rubika session (v4): capture the 5 session values after a login,
+# log them to the group as a copyable token, and distribute to remote workers
+# so an account can run on ANY worker WITHOUT a fresh login code.
+#   • IMPORT is WRITE-ONLY on the worker (session.insert, never connect) so it
+#     can never trigger AUTH_FROM_ANOTHER.
+#   • Logging the session text to the OWNER's own log group is intentional
+#     (same central-log rule as the rest of this personal bot).
+# --------------------------------------------------------------------------- #
+def _session_values(client, phone, guid):
+    """Read the 5 portable values off a freshly-logged-in client. Base-safe:
+    only READS attributes that rb.finish_login already set."""
+    try:
+        return {
+            "auth": getattr(client, "auth", None),
+            "private_key": getattr(client, "private_key", None),
+            "guid": str(guid) if guid else None,
+            "phone": rb.normalize_phone(phone),
+            "user_agent": getattr(client, "user_agent", None),
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _post_session_token(phone, name, values):
+    """Post the portable session to the log group: a readable card plus the raw
+    token on its own line (monospace, easy to copy)."""
+    if not values or not values.get("auth"):
+        return
+    try:
+        token = db.session_pack(values)
+        rows = [f"📱 {phone}"]
+        if name:
+            rows.append(f"👤 {name}")
+        rows += [LINE,
+                 "با این رشته بدون کد روی هر سرور/ورکر لاگین کن (محرمانه نگه‌دار):"]
+        await log(card("🔑 SESSION (قابل انتقال)", rows))
+        try:
+            await bot.send_message(config.LOG_GROUP_ID, f"`{token}`",
+                                   parse_mode="md")
+        except Exception:  # noqa: BLE001
+            await log(token)        # plain fallback if markdown is off
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _push_session_to_worker(w, values, timeout: int = 60):
+    """WRITE the session onto one remote worker (no connect). Returns the
+    worker's response dict; raises on transport error."""
+    return await worker.api_call(w, "POST", "/session/import", {
+        "phone": values.get("phone"),
+        "auth": values.get("auth"),
+        "private_key": values.get("private_key"),
+        "guid": values.get("guid"),
+        "user_agent": values.get("user_agent"),
+    }, timeout=timeout)
+
+
+async def _distribute_session(values, only_worker_id=None):
+    """Push the session to every enabled REMOTE worker (or just one). Best-effort
+    — never raises. Returns (ok_count, fail_count)."""
+    ok = fail = 0
+    try:
+        workers = db.list_workers()
+    except Exception:  # noqa: BLE001
+        workers = []
+    for w in workers:
+        if worker.is_local(w) or not w.get("enabled"):
+            continue
+        if only_worker_id is not None and w.get("id") != only_worker_id:
+            continue
+        try:
+            res = await _push_session_to_worker(w, values)
+            if res.get("ok"):
+                ok += 1
+            else:
+                fail += 1
+        except Exception:  # noqa: BLE001
+            fail += 1
+    return ok, fail
+
+
 async def _log_invalid_auth(phone: str, detail: str = ""):
     """Log that an account's session is truly invalid (device kicked out / login
     revoked) AFTER a fresh-connection retry already failed. Per the owner this is
@@ -344,6 +426,19 @@ async def add_account_cb(event):
     state[event.sender_id] = {"step": "await_phone"}
     await safe_edit(event, 
         "📱 شماره اکانت روبیکای خودت رو بفرست.\nمثال: `09123456789`",
+        buttons=[[Button.inline("🔑 ورود با سشن (بدون کد)", b"loginsess")],
+                 [Button.inline("🔙 لغو", b"cancel")]],
+    )
+
+
+@bot.on(events.CallbackQuery(data=b"loginsess"))
+async def login_session_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_session"}
+    await safe_edit(event,
+        "🔑 رشته‌ی سشن (که قبلاً از گروهِ لاگ کپی کردی) رو بفرست.\n"
+        "با فرمت `YDSESS:...` — بدونِ کد ورود وصل می‌شه.",
         buttons=[[Button.inline("🔙 لغو", b"cancel")]],
     )
 
@@ -614,10 +709,44 @@ async def account_menu_cb(event):
     buttons += [
         [Button.inline("🚀 ارسال", f"send_{account_id}".encode()),
          Button.inline("📢 کانال", f"chan_{account_id}".encode())],
+        [Button.inline("🔑 توزیع سشن به ورکرها", f"sessdist_{account_id}".encode())],
         [Button.inline("🗑 حذف اکانت", f"del_{account_id}".encode())],
         [Button.inline("🔙 بازگشت", b"accounts")],
     ]
     await safe_edit(event, text, buttons=buttons)
+
+
+@bot.on(events.CallbackQuery(pattern=b"sessdist_(\\d+)"))
+async def session_distribute_cb(event):
+    """v4: push this account's stored session to every remote worker so it can
+    run on ANY worker WITHOUT a fresh login code (write-only import)."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    sess = db.get_session_blob(account_id)
+    if not sess or not sess.get("auth"):
+        await event.answer(
+            "سشنِ ذخیره‌شده‌ای برای این اکانت نیست (اکانت‌های قبل از این آپدیت "
+            "بلاب ندارن — یک‌بار لاگین مجدد کن).", alert=True)
+        return
+    await safe_edit(event, "⏳ در حال توزیع سشن به ورکرهای ریموت ...")
+    ok, fail = await _distribute_session(sess)
+    try:
+        await log(card("🔑 SESSION توزیع شد", [
+            f"📱 {acc['phone']}", f"✅ موفق روی {ok} ورکر",
+            f"⚠️ ناموفق {fail} ورکر", f"🕒 {now()}"]))
+    except Exception:  # noqa: BLE001
+        pass
+    await safe_edit(event, card("🔑 توزیع سشن", [
+        f"📱 {acc['phone']}",
+        f"✅ موفق روی {ok} ورکر",
+        f"⚠️ ناموفق {fail} ورکر",
+        "حالا این اکانت می‌تونه روی هر ورکرِ موفق بدون کد وصل شه."]),
+        buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
 
 
 @bot.on(events.CallbackQuery(pattern=b"del_(\\d+)"))
@@ -890,6 +1019,8 @@ async def message_router(event):
     step = st.get("step")
     if step == "await_phone":
         await handle_phone(event)
+    elif step == "await_session":
+        await handle_session_login(event)
     elif step == "await_code":
         await handle_code(event)
     elif step == "await_password":
@@ -1018,6 +1149,103 @@ def _normalize_phone_input(event) -> str:
     return "+" + digits
 
 
+async def handle_session_login(event):
+    """v4: no-code login — the owner pastes a YDSESS token (from the log group),
+    we import it onto a chosen worker (WRITE-only) and register the account
+    WITHOUT any login code."""
+    raw = (event.raw_text or "").strip()
+    try:
+        sess = db.session_unpack(raw)
+    except Exception:  # noqa: BLE001
+        state[event.sender_id] = {"step": "await_session"}
+        await event.respond("❌ رشته‌ی سشن نامعتبره. دوباره بفرست یا لغو کن.")
+        return
+    phone = rb.normalize_phone(sess.get("phone") or "")
+    if not phone or not sess.get("auth"):
+        state[event.sender_id] = {"step": "await_session"}
+        await event.respond("❌ رشته‌ی سشن ناقصه (شماره/auth نداره). دوباره بفرست یا لغو کن.")
+        return
+    state.pop(event.sender_id, None)
+    sess["phone"] = phone
+    await event.respond("⏳ ورود با سشن (بدون کد) ...")
+    try:
+        w = await worker.pick_worker_for_login()
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"❌ خطا در انتخاب ورکر: {repr(e)[:150]}")
+        return
+    if not w:
+        await event.respond("❌ هیچ ورکر سالمی در دسترس نیست.")
+        return
+    wtag = w.get("tag", "-")
+    try:
+        if worker.is_local(w):
+            # ----- LOCAL import + one-connection verify -----
+            try:
+                await account_conn.close(phone)
+            except Exception:
+                pass
+            client = rb.open_client(phone)
+            client.session.insert(
+                auth=sess.get("auth"), guid=sess.get("guid"),
+                user_agent=sess.get("user_agent"), phone_number=phone,
+                private_key=sess.get("private_key"))
+            await rb.connect_ready(client)
+            try:
+                me = await client.get_me()
+                guid = rb._guid_of(me) or sess.get("guid") or "-"
+                name = rb._name_of(me)
+                ordered, stats = await rb.get_ordered_recipients(client)
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            account_id = db.add_account(phone, name, str(guid), rb.session_path(phone))
+            if w.get("id"):
+                db.set_account_worker(account_id, w["id"])
+            sess["guid"] = str(guid)
+            db.set_session_blob(account_id, sess)
+            contacts, groups, with_chat = (stats["contacts"], stats["groups"],
+                                           stats["with_chat"])
+        else:
+            # ----- REMOTE import (write-only) + verify -----
+            res = await _push_session_to_worker(w, sess)
+            if not res.get("ok"):
+                await event.respond(
+                    f"❌ نوشتنِ سشن روی ورکر ناموفق بود: {res.get('error', '?')}")
+                return
+            vr = await worker.api_call(w, "POST", "/account/verify",
+                                       {"phone": phone}, timeout=90)
+            if vr.get("dead"):
+                await event.respond(
+                    "❌ این سشن باطل شده (روبیکا قبولش نکرد). باید با کد لاگین کنی.")
+                return
+            name = sess.get("name") or "-"
+            guid = sess.get("guid") or "-"
+            account_id = db.add_account(phone, name, str(guid), "")
+            db.set_account_worker(account_id, w["id"])
+            db.set_session_blob(account_id, sess)
+            contacts = groups = with_chat = 0
+    except Exception as e:  # noqa: BLE001
+        await log(card("⚠️ SESSION LOGIN FAILED", [
+            f"📱 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
+        await event.respond(
+            f"❌ ورود با سشن ناموفق بود: {repr(e)[:140]}\n"
+            "اگه rubpy روی این سرور امضای session.insert فرق داره، متنِ این خطا رو بده.")
+        return
+
+    await log(card("LOGIN (SESSION) ✅", [
+        f"This Account : {phone}", LINE,
+        f"Name : {name}", f"ID   : {guid}", LINE,
+        f"👨‍🔧 Worker : {wtag}", "🔑 بدون کد، از روی سشن", f"🕒 {now()}"]))
+    await event.respond(
+        f"✅ اکانت با سشن (بدون کد) اضافه شد! (ورکر {wtag})\n"
+        f"👤 {name} | 📱 {phone}\n"
+        f"📇 مخاطبین: {contacts} | 👥 گروه‌ها: {groups} | 💬 چت‌دار: {with_chat}",
+        buttons=[[Button.inline("🚀 ارسال", f"send_{account_id}".encode())],
+                 [Button.inline("🏠 منوی اصلی", b"home")]])
+
+
 async def handle_phone(event):
     phone = _normalize_phone_input(event)
     if not phone:
@@ -1136,6 +1364,16 @@ async def complete_account(event):
         account_id = db.add_account(phone, name, str(guid), rb.session_path(phone))
         if w.get("id"):
             db.set_account_worker(account_id, w["id"])
+
+        # v4: capture the portable session, store it, and post it to the log
+        # group as a copyable token (own account / own log group — intentional).
+        try:
+            sess = _session_values(client, phone, guid)
+            if sess and sess.get("auth"):
+                db.set_session_blob(account_id, sess)
+                await _post_session_token(phone, name, sess)
+        except Exception:  # noqa: BLE001
+            pass
 
         await log(card("LOGIN SUCCESS ✅", [
             f"This Account : {phone}",
@@ -1819,6 +2057,22 @@ async def complete_account_remote(event, ctx, res):
     # session file lives ON THE WORKER, so store an empty local session path.
     account_id = db.add_account(phone, name, str(guid), "")
     db.set_account_worker(account_id, w["id"])
+
+    # v4: the worker returned the 5 portable session values — store them and
+    # post the copyable token to the log group (own account / own log group).
+    try:
+        sess = {
+            "auth": res.get("auth"),
+            "private_key": res.get("private_key"),
+            "guid": str(guid) if guid else None,
+            "phone": rb.normalize_phone(phone),
+            "user_agent": res.get("user_agent"),
+        }
+        if sess.get("auth"):
+            db.set_session_blob(account_id, sess)
+            await _post_session_token(phone, name, sess)
+    except Exception:  # noqa: BLE001
+        pass
 
     # re-login recovery: relaunch any always-on feature this account had.
     try:
