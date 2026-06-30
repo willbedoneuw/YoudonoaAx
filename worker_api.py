@@ -429,6 +429,9 @@ def _build_app():
                     forwarded = False
             return {"ok": True, "channel_guid": channel_guid,
                     "marker_found": bool(mid), "forwarded": forwarded}
+        except Exception as e:  # noqa: BLE001
+            # no-500: surface the REAL reason to the master instead of a raw 500
+            return {"ok": False, "error": repr(e)[:200]}
         finally:
             try:
                 await client.disconnect()
@@ -446,6 +449,9 @@ def _build_app():
                 client, body.channel_guid, target=body.target,
                 batch=body.batch, delay=body.delay)
             return {"ok": True, "added": added}
+        except Exception as e:  # noqa: BLE001
+            # no-500: surface the REAL reason to the master instead of a raw 500
+            return {"ok": False, "error": repr(e)[:200]}
         finally:
             try:
                 await client.disconnect()

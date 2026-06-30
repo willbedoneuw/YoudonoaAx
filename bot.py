@@ -1933,8 +1933,9 @@ async def channel_create_remote(event, acc, w, name, marker):
                        buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
         return
     if not res.get("ok") or not res.get("channel_guid"):
-        await safe_edit(msg, "❌ ساخت کانال روی ورکر ناموفق بود.",
-                       buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
+        await safe_edit(msg,
+            f"❌ ساخت کانال روی ورکر ناموفق بود.\n💥 {res.get('error', '—')}",
+            buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
         return
     pending_channel[event.sender_id] = {
         "account_id": acc["id"], "phone": acc["phone"], "channel_name": name,
@@ -2022,6 +2023,9 @@ async def run_channel_add_remote(owner_id: int, payload: dict):
             "delay": config.CHANNEL_ADD_DELAY,
         }, timeout=600)
         added = res.get("added", 0)
+        if not res.get("ok"):
+            await log(f"⚠️ عضو کردن مخاطبین کانال «{name}» روی ورکر ناموفق بود: "
+                      f"{res.get('error', '—')}")
     except Exception as e:  # noqa: BLE001
         await log(f"⚠️ عضو کردن مخاطبین کانال «{name}» روی ورکر ناقص ماند: {repr(e)[:150]}")
     pending_channel.pop(owner_id, None)
