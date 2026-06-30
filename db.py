@@ -1388,6 +1388,19 @@ def set_max_errors(value):
     set_setting("max_errors", value)
 
 
+# ---- Brain send cap (panel-editable; YoudonoaAx v3) ----
+def get_brain_cap() -> int:
+    return max(1, get_int_setting("brain_cap", config.BRAIN_SEND_CAP))
+
+
+def set_brain_cap(value):
+    try:
+        value = max(1, int(float(value)))
+    except (TypeError, ValueError):
+        value = config.BRAIN_SEND_CAP
+    set_setting("brain_cap", value)
+
+
 def get_resume_wait() -> int:
     return max(5, get_int_setting("resume_wait", config.RESUME_WAIT))
 

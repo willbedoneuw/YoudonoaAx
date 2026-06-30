@@ -944,6 +944,8 @@ async def message_router(event):
         await handle_set_senddelay(event, st)
     elif step == "await_set_contactspeed":
         await handle_set_contactspeed(event, st)
+    elif step == "await_set_braincap":
+        await handle_set_braincap(event, st)
     elif step == "await_discover_prefix":
         await handle_discover_prefix(event, st)
     elif step == "await_discover_text":
@@ -978,8 +980,51 @@ async def handle_delay(event):
                         buttons=main_menu(is_real_owner(event)))
 
 
+_FA_AR_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+                              "01234567890123456789")
+
+
+def _normalize_phone_input(event) -> str:
+    """Accept almost any phone format (FA/AR digits, spaces, dashes, 00/0/+98,
+    shared contact card) and return a clean +98XXXXXXXXXX style string.
+    Returns "" when no digits could be found."""
+    raw = (getattr(event, "raw_text", "") or "").strip()
+    # shared contact card (user tapped "share contact")
+    if not raw:
+        try:
+            contact = getattr(getattr(event, "message", None), "contact", None) \
+                or getattr(event, "contact", None)
+            if contact and getattr(contact, "phone_number", None):
+                raw = str(contact.phone_number)
+        except Exception:
+            raw = ""
+    if not raw:
+        return ""
+    raw = raw.translate(_FA_AR_DIGITS)
+    has_plus = "+" in raw
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return ""
+    if has_plus:
+        return "+" + digits
+    if digits.startswith("00"):
+        return "+" + digits[2:]
+    if digits.startswith("98"):
+        return "+" + digits
+    if digits.startswith("0") and len(digits) >= 10:
+        return "+98" + digits[1:]
+    if len(digits) == 10 and digits.startswith("9"):
+        return "+98" + digits
+    return "+" + digits
+
+
 async def handle_phone(event):
-    phone = event.raw_text.strip()
+    phone = _normalize_phone_input(event)
+    if not phone:
+        await event.respond(
+            "❌ شماره خونده نشد. شماره رو با کدِ کشور بفرست (مثلاً +989121234567 "
+            "یا 09121234567) یا لغو کن.")
+        return
     await event.respond("⏳ در حال انتخاب ورکر سالم و اتصال به روبیکا ...")
     # Pick the worker that will OWN this account (round-robin + health check).
     try:
@@ -4496,7 +4541,12 @@ async def tg_add_cb(event):
 
 
 async def handle_tg_phone(event):
-    phone = event.raw_text.strip().replace(" ", "")
+    phone = _normalize_phone_input(event)
+    if not phone:
+        await event.respond(
+            "❌ شماره خونده نشد. شماره رو با کدِ کشور بفرست (مثلاً +989121234567 "
+            "یا 09121234567) یا لغو کن.")
+        return
     await event.respond("⏳ اتصال به تلگرام و ارسالِ کد ...")
     try:
         ctx = await tg.start_login(phone)
@@ -5088,6 +5138,7 @@ multisend_sel = {}                 # owner_id -> set(account_id)
 multisend_stop = {}                # owner_id -> bool
 brain_sel = {}                     # owner_id -> set(account_id)
 brain_jobs = {}                    # owner_id -> dict (per-account collected guids)
+brain_engine = {"stop": False, "accounts": []}  # global brain stop flag (add + send phases)
 
 
 def _norm_pairs_from_text(text: str):
@@ -6424,7 +6475,7 @@ async def brain_cb(event):
         "🧠 مغز — تقسیم شماره‌ها بین اکانت‌ها\n"
         f"{LINE}\nاکانت‌ها رو انتخاب کن، بعد فایل شماره رو آپلود کن.\n"
         "شماره‌ها مساوی بین اکانت‌ها تقسیم می‌شن، اضافه می‌شن، بعد به "
-        f"{config.BRAIN_SEND_CAP} مخاطبِ اضافه‌شده‌ی هر اکانت ارسال می‌شه.",
+        f"{db.get_brain_cap()} مخاطبِ اضافه‌شده‌ی هر اکانت ارسال می‌شه.",
         buttons=_brain_menu(event.sender_id))
 
 
@@ -6487,11 +6538,14 @@ async def handle_brain_file(event, st):
     await event.respond(
         f"🧠 {len(pairs)} شماره‌ی یکتا بین {len(accounts)} اکانت تقسیم شد. "
         "شروع افزودن ... گزارش‌ها تو گروه لاگ میاد.",
-        buttons=main_menu(is_real_owner(event)))
+        buttons=[[Button.inline("⏹ توقف مغز", b"bstop")],
+                 [Button.inline("🏠 منوی اصلی", b"home")]])
+    brain_engine["stop"] = False
     asyncio.create_task(_run_brain(event.sender_id, accounts, shares))
 
 
 async def _run_brain(owner_id, accounts, shares):
+    brain_engine["accounts"] = [a["id"] for a in accounts]
     for i, a in enumerate(accounts, 1):
         a["_tag"] = f"#A{i}"
     await log(card("🧠 BRAIN START", [
@@ -6502,6 +6556,9 @@ async def _run_brain(owner_id, accounts, shares):
     per_acc = {}     # account_id -> {"acc":acc,"guids":[...],"added":n,"failed":n}
     delay = db.get_contact_delay()
     for a in accounts:
+        if brain_engine.get("stop"):
+            await log(card("🧠 BRAIN — توقف دستی (افزودن)", [f"🕒 {now()}"]))
+            break
         tag = a["_tag"]
         pairs = shares.get(a["id"], [])
         if not pairs:
@@ -6530,7 +6587,7 @@ async def _run_brain(owner_id, accounts, shares):
     await log(card("🧠 BRAIN — افزودن تمام شد", [
         f"✅ مجموع مخاطب اضافه‌شده : {total_added}",
         f"👥 اکانت‌ها : {len(per_acc)}", f"🕒 {now()}"]))
-    rows = [[Button.inline(f"🚀 ارسال به مخاطب‌های اضافه‌شده (تا {config.BRAIN_SEND_CAP})",
+    rows = [[Button.inline(f"🚀 ارسال به مخاطب‌های اضافه‌شده (تا {db.get_brain_cap()})",
                            b"bsend")],
             [Button.inline("🏠 منوی اصلی", b"home")]]
     try:
@@ -6554,7 +6611,7 @@ async def brain_send_cb(event):
     marker = db.get_marker()
     await safe_edit(event, card("🧠 آماده‌ی ارسال", [
         f"📌 مارکر : «{marker}»",
-        f"🎯 هر اکانت تا {config.BRAIN_SEND_CAP} مخاطبِ اضافه‌شده‌ی خودش",
+        f"🎯 هر اکانت تا {db.get_brain_cap()} مخاطبِ اضافه‌شده‌ی خودش",
         "تأیید کن تا شروع بشه."]),
         buttons=[[Button.inline("✅ تأیید و ارسال", b"bsendgo")],
                  [Button.inline("🔙 بازگشت", b"home")]])
@@ -6569,17 +6626,38 @@ async def brain_send_go_cb(event):
         await event.answer("اطلاعات منقضی شده.", alert=True)
         return
     await safe_edit(event, "🚀 ارسال مغز شروع شد. گزارش‌ها تو گروه لاگ میاد.",
-                    buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+                    buttons=[[Button.inline("⏹ توقف مغز", b"bstop")],
+                             [Button.inline("🏠 منوی اصلی", b"home")]])
+    brain_engine["stop"] = False
     asyncio.create_task(_run_brain_send(event.sender_id, job))
 
 
+@bot.on(events.CallbackQuery(data=b"bstop"))
+async def brain_stop_cb(event):
+    if not is_owner(event):
+        return
+    brain_engine["stop"] = True
+    # also halt any in-flight local run_send loops for the brain's accounts
+    try:
+        ids = brain_engine.get("accounts") or [a["id"] for a in db.list_accounts()]
+        for aid in ids:
+            stop_flags[aid] = True
+    except Exception:
+        pass
+    await event.answer("⏹ توقف مغز ثبت شد. در مرز اکانت بعدی متوقف می‌شه.", alert=True)
+
+
 async def _run_brain_send(owner_id, job):
+    brain_engine["accounts"] = list(job.keys())
     marker = db.get_marker()
     delay = db.get_delay()
-    cap = config.BRAIN_SEND_CAP
+    cap = db.get_brain_cap()
     await log(card("🧠 BRAIN SEND START", [
         f"📌 مارکر : «{marker}»", f"🎯 سقف هر اکانت : {cap}", f"🕒 {now()}"]))
     for aid, info in job.items():
+        if brain_engine.get("stop"):
+            await log(card("🧠 BRAIN SEND — توقف دستی", [f"🕒 {now()}"]))
+            break
         acc = info["acc"]
         tag = acc.get("_tag", "")
         guids = (info.get("guids") or [])[:cap]
@@ -7278,6 +7356,7 @@ def _settings_text():
         f"⏸ مدت وقفه (ثانیه) : {db.get_resume_wait()}",
         f"⏱ سرعت ارسال (ثانیه) : {db.get_delay()}",
         f"📇 سرعت افزودن مخاطب (ثانیه) : {db.get_contact_delay()}",
+        f"🧠 سقف ارسال مغز (هر اکانت) : {db.get_brain_cap()}",
         LINE,
         "هر کدوم رو می‌خوای عوض کنی بزن:",
     ])
@@ -7289,6 +7368,7 @@ def _settings_buttons():
          Button.inline("⏸ مدت وقفه", b"set_resume")],
         [Button.inline("⏱ سرعت ارسال", b"set_senddelay"),
          Button.inline("📇 سرعت مخاطب", b"set_cspeed")],
+        [Button.inline("🧠 سقف مغز", b"set_braincap")],
         [Button.inline("🔙 بازگشت", b"home")],
     ]
 
@@ -7340,6 +7420,16 @@ async def set_cspeed_cb(event):
         buttons=[[Button.inline("🔙 بازگشت", b"settings")]])
 
 
+@bot.on(events.CallbackQuery(data=b"set_braincap"))
+async def set_braincap_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_set_braincap"}
+    await safe_edit(event,
+        f"🧠 سقف ارسال مغز برای هر اکانت رو بفرست (مثلاً {config.BRAIN_SEND_CAP}):",
+        buttons=[[Button.inline("🔙 بازگشت", b"settings")]])
+
+
 async def handle_set_maxerr(event, st):
     state.pop(event.sender_id, None)
     db.set_max_errors(event.raw_text.strip())
@@ -7368,6 +7458,13 @@ async def handle_set_contactspeed(event, st):
     await event.respond(f"✅ سرعت افزودن مخاطب روی {db.get_contact_delay()} ثانیه تنظیم شد.",
                         buttons=[[Button.inline("🔙 بازگشت",
                                                 back.encode() if isinstance(back, str) else b"settings")]])
+
+
+async def handle_set_braincap(event, st):
+    state.pop(event.sender_id, None)
+    db.set_brain_cap(event.raw_text.strip())
+    await event.respond(f"✅ سقف ارسال مغز روی {db.get_brain_cap()} مخاطب برای هر اکانت تنظیم شد.",
+                        buttons=_settings_buttons())
 
 
 if __name__ == "__main__":
