@@ -1121,6 +1121,8 @@ async def message_router(event):
         await handle_set_contactspeed(event, st)
     elif step == "await_set_braincap":
         await handle_set_braincap(event, st)
+    elif step == "await_set_disctarget":
+        await handle_set_disctarget(event, st)
     elif step == "await_discover_prefix":
         await handle_discover_prefix(event, st)
     elif step == "await_discover_text":
@@ -5576,7 +5578,11 @@ async def resume_relogin_cb(event):
         return
     phone = rec["phone"]
     acc = db.get_account(aid)
-    cur_wid = acc.get("worker_id") if acc else None
+    # resolve the account's CURRENT server robustly (worker_id may be None ->
+    # that means it lives on the master). Excluding this guarantees the transfer
+    # always lands on a DIFFERENT server (or cleanly says there isn't one).
+    cur_w = worker.worker_for_account(acc) if acc else None
+    cur_wid = cur_w["id"] if cur_w else None
     await safe_edit(event, "🔁 در حال پیدا کردن یک ورکرِ دیگه (غیر از سرور فعلی) برای انتقال ...")
     # WORKER TRANSFER: pick a worker that is NOT the account's current server.
     try:
@@ -5817,7 +5823,25 @@ async def contacts_speed_cb(event):
     state[event.sender_id] = {"step": "await_set_contactspeed", "back": "contacts"}
     await safe_edit(event,
         f"⏱ سرعت افزودن مخاطب فعلی: {db.get_contact_delay()} ثانیه\n"
-        f"یک عدد بین {config.CONTACT_MIN_DELAY} تا {config.CONTACT_MAX_DELAY} بفرست:",
+        f"یک عدد بین {config.CONTACT_MIN_DELAY} تا {config.CONTACT_MAX_DELAY} بفرست، "
+        "یا یکی از گزینه‌های سریع رو بزن:",
+        buttons=[
+            [Button.inline("0.1s", b"cspd_0.1"), Button.inline("0.3s", b"cspd_0.3"),
+             Button.inline("0.5s", b"cspd_0.5")],
+            [Button.inline("1s", b"cspd_1"), Button.inline("2s", b"cspd_2"),
+             Button.inline("5s", b"cspd_5")],
+            [Button.inline("🔙 بازگشت", b"contacts")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"cspd_([0-9.]+)"))
+async def contacts_speed_preset_cb(event):
+    if not is_owner(event):
+        return
+    val = event.pattern_match.group(1).decode()
+    db.set_contact_delay(val)
+    state.pop(event.sender_id, None)
+    await safe_edit(event,
+        f"✅ سرعت افزودن مخاطب روی {db.get_contact_delay()} ثانیه تنظیم شد.",
         buttons=[[Button.inline("🔙 بازگشت", b"contacts")]])
 
 
@@ -6299,7 +6323,7 @@ async def _send_to_guids(owner_id, acc, guids, mode, text, tag=""):
 async def _run_discovery(owner_id, accounts, prefix, mode, text):
     """Discover DISCOVERY_TARGET rubika-having numbers per account, then send to
     them in the chosen mode, and report the success rate."""
-    target = config.DISCOVERY_TARGET
+    target = db.get_discovery_target()
     _mode_label = ("بدون ارسال (فقط ساخت مخاطب)" if mode == "none"
                    else ("متن دلخواه" if mode == "text" else "مارکر"))
     for i, a in enumerate(accounts, 1):
@@ -6434,7 +6458,7 @@ async def discover_menu_cb(event):
     await safe_edit(event,
         "🔎 کشف دوست با پیش‌شماره\n"
         f"{LINE}\nیک اکانت انتخاب کن، بعد پیش‌شماره رو بفرست.\n"
-        f"ربات تا پیدا کردن {config.DISCOVERY_TARGET} شماره‌ی روبیکادار ادامه می‌ده.\n"
+        f"ربات تا پیدا کردن {db.get_discovery_target()} شماره‌ی روبیکادار ادامه می‌ده.\n"
         f"⏱ سرعتِ پروب الان: {spd} ثانیه (هرچی کمتر = سریع‌تر ولی پرریسک‌تر).",
         buttons=rows)
 
@@ -6481,7 +6505,7 @@ async def brain_discover_cb(event):
     state[event.sender_id] = {"step": "await_discover_prefix", "ids": sel}
     await safe_edit(event,
         f"☎️ پیش‌شماره رو بفرست. هر کدوم از {len(sel)} اکانت تا "
-        f"{config.DISCOVERY_TARGET} شماره‌ی روبیکادار پیدا و ارسال می‌کنه.\n"
+        f"{db.get_discovery_target()} شماره‌ی روبیکادار پیدا و ارسال می‌کنه.\n"
         "مثال: `0913` یا `09135646`.",
         buttons=[[Button.inline("🔙 لغو", b"brain")]])
 
@@ -7685,6 +7709,7 @@ def _settings_text():
         f"⏱ سرعت ارسال (ثانیه) : {db.get_delay()}",
         f"📇 سرعت افزودن مخاطب (ثانیه) : {db.get_contact_delay()}",
         f"🧠 سقف ارسال مغز (هر اکانت) : {db.get_brain_cap()}",
+        f"🔎 سقف کشف دوست : {db.get_discovery_target()}",
         LINE,
         "هر کدوم رو می‌خوای عوض کنی بزن:",
     ])
@@ -7697,6 +7722,7 @@ def _settings_buttons():
         [Button.inline("⏱ سرعت ارسال", b"set_senddelay"),
          Button.inline("📇 سرعت مخاطب", b"set_cspeed")],
         [Button.inline("🧠 سقف مغز", b"set_braincap")],
+        [Button.inline("🔎 سقف کشف دوست", b"set_disctarget")],
         [Button.inline("🔙 بازگشت", b"home")],
     ]
 
@@ -7758,6 +7784,16 @@ async def set_braincap_cb(event):
         buttons=[[Button.inline("🔙 بازگشت", b"settings")]])
 
 
+@bot.on(events.CallbackQuery(data=b"set_disctarget"))
+async def set_disctarget_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_set_disctarget"}
+    await safe_edit(event,
+        f"🔎 سقف کشف دوست رو بفرست (هر عددی، مثلاً {config.DISCOVERY_TARGET} یا 10 یا 300):",
+        buttons=[[Button.inline("🔙 بازگشت", b"settings")]])
+
+
 async def handle_set_maxerr(event, st):
     state.pop(event.sender_id, None)
     db.set_max_errors(event.raw_text.strip())
@@ -7792,6 +7828,13 @@ async def handle_set_braincap(event, st):
     state.pop(event.sender_id, None)
     db.set_brain_cap(event.raw_text.strip())
     await event.respond(f"✅ سقف ارسال مغز روی {db.get_brain_cap()} مخاطب برای هر اکانت تنظیم شد.",
+                        buttons=_settings_buttons())
+
+
+async def handle_set_disctarget(event, st):
+    state.pop(event.sender_id, None)
+    db.set_discovery_target(event.raw_text.strip())
+    await event.respond(f"✅ سقف کشف دوست روی {db.get_discovery_target()} شماره تنظیم شد.",
                         buttons=_settings_buttons())
 
 
