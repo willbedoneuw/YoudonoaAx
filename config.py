@@ -305,8 +305,8 @@ def now_str() -> str:
 SEND_LOG_EVERY = _int("SEND_LOG_EVERY", 50)
 
 # ---- Contact import (افزودن مخاطب با فایل txt) ----
-# Per-contact delay bounds (seconds) — adjustable from the panel (0.5 .. 10).
-CONTACT_MIN_DELAY = 0.5
+# Per-contact delay bounds (seconds) — adjustable from the panel (0.1 .. 10).
+CONTACT_MIN_DELAY = 0.1
 CONTACT_MAX_DELAY = 10.0
 CONTACT_ADD_DELAY = _float("CONTACT_ADD_DELAY", 1.0)
 # Post a progress log to the group every this-many contacts added.

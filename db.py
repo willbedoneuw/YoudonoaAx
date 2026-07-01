@@ -1473,6 +1473,19 @@ def set_brain_cap(value):
     set_setting("brain_cap", value)
 
 
+# ---- Discovery target (panel-editable; «سقف کشف دوست») ----
+def get_discovery_target() -> int:
+    return max(1, get_int_setting("discovery_target", config.DISCOVERY_TARGET))
+
+
+def set_discovery_target(value):
+    try:
+        value = max(1, int(float(value)))
+    except (TypeError, ValueError):
+        value = config.DISCOVERY_TARGET
+    set_setting("discovery_target", value)
+
+
 def get_resume_wait() -> int:
     return max(5, get_int_setting("resume_wait", config.RESUME_WAIT))
 
