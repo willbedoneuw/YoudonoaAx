@@ -1486,6 +1486,18 @@ def set_discovery_target(value):
     set_setting("discovery_target", value)
 
 
+def get_discovery_max_attempts() -> int:
+    return max(1, get_int_setting("discovery_max_attempts", config.DISCOVERY_MAX_ATTEMPTS))
+
+
+def set_discovery_max_attempts(value):
+    try:
+        value = max(1, int(float(value)))
+    except (TypeError, ValueError):
+        value = config.DISCOVERY_MAX_ATTEMPTS
+    set_setting("discovery_max_attempts", value)
+
+
 def get_resume_wait() -> int:
     return max(5, get_int_setting("resume_wait", config.RESUME_WAIT))
 

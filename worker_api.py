@@ -268,6 +268,7 @@ def _build_app():
         mode: str = "marker"      # 'marker' (forward) or 'text' (send_text)
         text: str = ""
         text2: str = ""          # step 5: optional Rubika second text (always text)
+        order: bool = False       # reorder guids: chat-first -> online -> last-seen
 
     class LinkdooniIn(BaseModel):
         phone: str
@@ -922,10 +923,19 @@ def _build_app():
                 saved_guid, mid = await rb.find_marked_message(client, body.marker or "")
                 if not mid:
                     return {"marker_found": False, "sent": 0, "fail": 0}
+            guids = list(body.guids or [])
+            # order like a normal send (chat-first -> online -> last-seen) when asked
+            if getattr(body, "order", False) and guids:
+                try:
+                    ordered, _st = await rb.get_ordered_recipients(client)
+                    rank = {g: i for i, g in enumerate(ordered)}
+                    guids = sorted(guids, key=lambda g: rank.get(g, 10 ** 9))
+                except Exception:  # noqa: BLE001
+                    pass
             ok = 0
             fail = 0
             attempt_fail = 0
-            for g in (body.guids or []):
+            for g in guids:
                 try:
                     if mode == "text":
                         await asyncio.wait_for(

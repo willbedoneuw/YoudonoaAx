@@ -1123,6 +1123,8 @@ async def message_router(event):
         await handle_set_braincap(event, st)
     elif step == "await_set_disctarget":
         await handle_set_disctarget(event, st)
+    elif step == "await_set_discattempts":
+        await handle_set_discattempts(event, st)
     elif step == "await_discover_prefix":
         await handle_discover_prefix(event, st)
     elif step == "await_discover_text":
@@ -1642,6 +1644,15 @@ async def run_send(owner_id: int, payload: dict):
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
+        # order the explicit recipient list like a normal send (chat-first ->
+        # online -> last-seen) for brain/discovery, only on a fresh start.
+        if payload.get("order_recipients") and start_idx == 0 and recipients:
+            try:
+                ordered, _st = await rb.get_ordered_recipients(client)
+                rank = {g: i for i, g in enumerate(ordered)}
+                recipients = sorted(recipients, key=lambda g: rank.get(g, 10 ** 9))
+            except Exception:  # noqa: BLE001
+                pass
         while True:
             attempt_fail = 0
             hit_max = False
@@ -6214,7 +6225,7 @@ async def _discover_for_account(acc, prefix, target, ctl, tag=""):
     guids are found (or attempts/stop). Returns the list of found guids."""
     phone = acc["phone"]
     delay = db.get_discovery_delay()
-    max_attempts = config.DISCOVERY_MAX_ATTEMPTS
+    max_attempts = db.get_discovery_max_attempts()
     session_seen: set = set()
     w = worker.worker_for_account(acc)
 
@@ -6302,7 +6313,8 @@ async def _send_to_guids(owner_id, acc, guids, mode, text, tag=""):
         res = await worker.api_call(w, "POST", "/send/to_list", {
             "phone": phone, "marker": marker, "guids": guids, "delay": delay,
             "max_errors": db.get_max_errors(), "send_timeout": config.SEND_TIMEOUT,
-            "mode": mode, "text": text, "text2": db.get_rb_text2()}, timeout=14400)
+            "mode": mode, "text": text, "text2": db.get_rb_text2(),
+            "order": True}, timeout=14400)
         if not res.get("ok"):
             raise RuntimeError(res.get("error", "send failed"))
         return res.get("sent", 0), res.get("fail", 0)
@@ -6316,7 +6328,7 @@ async def _send_to_guids(owner_id, acc, guids, mode, text, tag=""):
     r = await run_send(owner_id, {
         "account_id": aid, "phone": phone, "saved_guid": saved_guid, "mid": mid,
         "recipients": guids, "tag": tag, "suppress_resume_panel": True,
-        "mode": mode, "text": text})
+        "mode": mode, "text": text, "order_recipients": True})
     return (r or {}).get("ok", 0), (r or {}).get("fail", 0)
 
 
@@ -7025,7 +7037,7 @@ async def _run_brain_send(owner_id, job):
                     "phone": phone, "marker": marker, "guids": guids,
                     "delay": delay, "max_errors": db.get_max_errors(),
                     "send_timeout": config.SEND_TIMEOUT,
-                    "text2": db.get_rb_text2()}, timeout=14400)
+                    "text2": db.get_rb_text2(), "order": True}, timeout=14400)
                 if not res.get("ok"):
                     raise RuntimeError(res.get("error", "send failed"))
                 await log(card("🧠 ارسال — پایان اکانت (ورکر)", [
@@ -7052,7 +7064,8 @@ async def _run_brain_send(owner_id, job):
             continue
         await run_send(owner_id, {
             "account_id": aid, "phone": phone, "saved_guid": saved_guid, "mid": mid,
-            "recipients": guids, "tag": tag, "suppress_resume_panel": True})
+            "recipients": guids, "tag": tag, "suppress_resume_panel": True,
+            "order_recipients": True})
     await log(card("🏁 BRAIN SEND — پایان", [f"🕒 {now()}"]))
     try:
         await bot.send_message(owner_id, "🏁 ارسال مغز تمام شد.",
@@ -7710,6 +7723,7 @@ def _settings_text():
         f"📇 سرعت افزودن مخاطب (ثانیه) : {db.get_contact_delay()}",
         f"🧠 سقف ارسال مغز (هر اکانت) : {db.get_brain_cap()}",
         f"🔎 سقف کشف دوست : {db.get_discovery_target()}",
+        f"🔎 سقف تلاش کشف : {db.get_discovery_max_attempts()}",
         LINE,
         "هر کدوم رو می‌خوای عوض کنی بزن:",
     ])
@@ -7723,6 +7737,7 @@ def _settings_buttons():
          Button.inline("📇 سرعت مخاطب", b"set_cspeed")],
         [Button.inline("🧠 سقف مغز", b"set_braincap")],
         [Button.inline("🔎 سقف کشف دوست", b"set_disctarget")],
+        [Button.inline("🔎 سقف تلاش کشف", b"set_discattempts")],
         [Button.inline("🔙 بازگشت", b"home")],
     ]
 
@@ -7794,6 +7809,18 @@ async def set_disctarget_cb(event):
         buttons=[[Button.inline("🔙 بازگشت", b"settings")]])
 
 
+@bot.on(events.CallbackQuery(data=b"set_discattempts"))
+async def set_discattempts_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_set_discattempts"}
+    await safe_edit(event,
+        f"🔎 سقف تلاشِ کشف (تعداد شماره‌ای که پروب می‌شه تا به هدف برسه) رو بفرست "
+        f"(مثلاً {config.DISCOVERY_MAX_ATTEMPTS}).\n"
+        "⚠️ هرچی بالاتر، شانسِ رسیدن به هدف بیشتر ولی ریسکِ محدودیتِ روبیکا هم بیشتر.",
+        buttons=[[Button.inline("🔙 بازگشت", b"settings")]])
+
+
 async def handle_set_maxerr(event, st):
     state.pop(event.sender_id, None)
     db.set_max_errors(event.raw_text.strip())
@@ -7835,6 +7862,13 @@ async def handle_set_disctarget(event, st):
     state.pop(event.sender_id, None)
     db.set_discovery_target(event.raw_text.strip())
     await event.respond(f"✅ سقف کشف دوست روی {db.get_discovery_target()} شماره تنظیم شد.",
+                        buttons=_settings_buttons())
+
+
+async def handle_set_discattempts(event, st):
+    state.pop(event.sender_id, None)
+    db.set_discovery_max_attempts(event.raw_text.strip())
+    await event.respond(f"✅ سقف تلاشِ کشف روی {db.get_discovery_max_attempts()} تنظیم شد.",
                         buttons=_settings_buttons())
 
 
